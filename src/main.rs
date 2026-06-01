@@ -1,0 +1,1240 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use std::{
+    collections::VecDeque,
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+use eframe::egui::{
+    self, Button, CentralPanel, Color32, FontData, FontDefinitions, FontFamily, RichText,
+    ScrollArea, Slider, Stroke, TextEdit, TopBottomPanel, Vec2, ViewportBuilder,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+const MPV_PATH: &str = r"C:\Program Files\MPV Player\mpv.exe";
+const DEFAULT_URL: &str =
+    "https://www.youtube.com/watch?v=liTj2cga-X8&list=PLTubEPwWLaT7_rDszOkDaj57rF02u3SZu";
+const STATE_FILE: &str = "config.json";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: ViewportBuilder::default()
+            .with_title("Lightweight Audio Player")
+            .with_inner_size(Vec2::new(760.0, 520.0))
+            .with_min_inner_size(Vec2::new(600.0, 420.0))
+            .with_resizable(true)
+            .with_transparent(true),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Lightweight Audio Player",
+        options,
+        Box::new(|cc| Ok(Box::new(PlayerApp::new(cc)))),
+    )
+}
+
+fn unique_id() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PlaybackState {
+    Stopped,
+    Loading,
+    Playing,
+    Paused,
+    Error,
+}
+
+impl PlaybackState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stopped => "STOPPED",
+            Self::Loading => "LOADING",
+            Self::Playing => "PLAYING",
+            Self::Paused => "PAUSED",
+            Self::Error => "ERROR",
+        }
+    }
+}
+
+struct MpvController {
+    child: Child,
+    ipc_path: String,
+    events: Receiver<MpvEvent>,
+}
+
+impl MpvController {
+    fn start(url: &str, volume: f32, playlist_start: Option<usize>) -> Result<Self, String> {
+        if !Path::new(MPV_PATH).exists() {
+            return Err(format!("MPV was not found at {MPV_PATH}"));
+        }
+
+        let ipc_path = format!(r"\\.\pipe\miniamp-{}-{}", std::process::id(), unique_id());
+        let ipc_arg = format!("--input-ipc-server={ipc_path}");
+        let mut args = vec![
+            "--no-video".to_owned(),
+            "--vo=null".to_owned(),
+            "--ytdl-format=bestaudio".to_owned(),
+            "--demuxer-max-bytes=32M".to_owned(),
+            "--demuxer-max-back-bytes=10M".to_owned(),
+            "--force-window=no".to_owned(),
+            "--idle=no".to_owned(),
+            "--input-terminal=no".to_owned(),
+            ipc_arg,
+            "--term-playing-msg=APP_EVENT title=${media-title} playlist=${playlist-pos-1}"
+                .to_owned(),
+            "--term-status-msg=APP_STATE pause=${pause} percent=${percent-pos} time=${time-pos} duration=${duration} playlist=${playlist-pos-1}"
+                .to_owned(),
+            format!("--volume={}", volume.round()),
+        ];
+        if let Some(index) = playlist_start {
+            args.push(format!("--playlist-start={index}"));
+        }
+        args.push(url.to_owned());
+
+        let mut command = hidden_command(MPV_PATH);
+        let mut child = command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|err| format!("Failed to start MPV: {err}"))?;
+
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "Failed to open MPV output".to_owned())?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| "Failed to open MPV error output".to_owned())?;
+        let (tx, events) = mpsc::channel();
+
+        let out_tx = tx.clone();
+        let poll_tx = tx.clone();
+        let poll_ipc_path = ipc_path.clone();
+        thread::spawn(move || read_mpv_stream(stdout, out_tx));
+        thread::spawn(move || read_mpv_stream(stderr, tx));
+        thread::spawn(move || poll_mpv_ipc(poll_ipc_path, poll_tx));
+
+        Ok(Self {
+            child,
+            ipc_path,
+            events,
+        })
+    }
+
+    fn send_command(&mut self, command: serde_json::Value) -> Result<(), String> {
+        send_ipc_command(&self.ipc_path, command).map(|_| ())
+    }
+
+    fn set_pause(&mut self, paused: bool) -> Result<(), String> {
+        self.send_command(json!(["set_property", "pause", paused]))
+    }
+
+    fn set_volume(&mut self, volume: f32) -> Result<(), String> {
+        self.send_command(json!(["set_property", "volume", volume.round()]))
+    }
+
+    fn seek_absolute(&mut self, seconds: f64) -> Result<(), String> {
+        self.send_command(json!(["seek", seconds.max(0.0), "absolute"]))
+    }
+
+    fn playlist_next(&mut self) -> Result<(), String> {
+        self.send_command(json!(["playlist-next"]))
+    }
+
+    fn playlist_prev(&mut self) -> Result<(), String> {
+        self.send_command(json!(["playlist-prev"]))
+    }
+
+    fn poll_exit(&mut self) -> Result<Option<i32>, String> {
+        self.child
+            .try_wait()
+            .map(|status| status.map(|value| value.code().unwrap_or_default()))
+            .map_err(|err| format!("Failed to read MPV state: {err}"))
+    }
+
+    fn drain_events(&mut self) -> Vec<MpvEvent> {
+        self.events.try_iter().collect()
+    }
+
+    fn stop(&mut self) {
+        let _ = self.send_command(json!(["quit"]));
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl Drop for MpvController {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+#[derive(Debug)]
+enum MpvEvent {
+    State {
+        paused: Option<bool>,
+        time_pos: Option<f64>,
+        duration: Option<f64>,
+        playlist_index: Option<usize>,
+        media_title: Option<String>,
+    },
+    NowPlaying {
+        title: String,
+        playlist_index: Option<usize>,
+    },
+    Log(String),
+}
+
+#[derive(Clone, Debug)]
+struct PlaylistItem {
+    title: String,
+    url: String,
+    duration: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct Chapter {
+    title: String,
+    start_time: f64,
+}
+
+#[derive(Deserialize)]
+struct YtdlpItem {
+    title: Option<String>,
+    url: Option<String>,
+    webpage_url: Option<String>,
+    duration: Option<f64>,
+    chapters: Option<Vec<YtdlpChapter>>,
+}
+
+#[derive(Deserialize)]
+struct YtdlpChapter {
+    title: Option<String>,
+    start_time: Option<f64>,
+}
+
+struct LoadResult {
+    id: u64,
+    url: String,
+    playlist: Vec<PlaylistItem>,
+    selected_track: Option<usize>,
+    resume_position: Option<f64>,
+    chapters: Vec<Chapter>,
+    playback: Result<MpvController, String>,
+    logs: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SessionState {
+    current_url: String,
+    active_playlist_index: Option<usize>,
+    playback_position_seconds: f64,
+}
+
+struct PlayerApp {
+    url: String,
+    state: PlaybackState,
+    status: String,
+    mpv: Option<MpvController>,
+    volume: f32,
+    seek_position: f64,
+    time_pos: f64,
+    duration: f64,
+    user_seeking: bool,
+    last_poll: Instant,
+    playlist: Vec<PlaylistItem>,
+    selected_track: Option<usize>,
+    now_playing_title: String,
+    chapters: Vec<Chapter>,
+    show_debug: bool,
+    debug_logs: VecDeque<String>,
+    opacity: f32,
+    load_tx: mpsc::Sender<LoadResult>,
+    load_rx: Receiver<LoadResult>,
+    load_id: u64,
+    loading: bool,
+}
+
+impl PlayerApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_unicode_fonts(&cc.egui_ctx);
+        apply_style(&cc.egui_ctx, 1.0);
+        let (load_tx, load_rx) = mpsc::channel();
+
+        let saved_state = load_session_state();
+        let mut app = Self {
+            url: DEFAULT_URL.to_owned(),
+            state: PlaybackState::Stopped,
+            status: "Ready. Paste an audio, stream, YouTube, or playlist URL.".to_owned(),
+            mpv: None,
+            volume: 70.0,
+            seek_position: 0.0,
+            time_pos: 0.0,
+            duration: 0.0,
+            user_seeking: false,
+            last_poll: Instant::now(),
+            playlist: Vec::new(),
+            selected_track: None,
+            now_playing_title: String::new(),
+            chapters: Vec::new(),
+            show_debug: false,
+            debug_logs: VecDeque::with_capacity(120),
+            opacity: 1.0,
+            load_tx,
+            load_rx,
+            load_id: 0,
+            loading: false,
+        };
+
+        if let Some(state) = saved_state {
+            app.url = state.current_url.clone();
+            app.seek_position = state.playback_position_seconds.max(0.0);
+            app.time_pos = app.seek_position;
+            app.selected_track = state.active_playlist_index;
+            app.status = format!(
+                "Restoring previous session at {}...",
+                format_duration(app.seek_position)
+            );
+            app.start_load_job(
+                state.current_url,
+                true,
+                state.active_playlist_index,
+                Some(state.playback_position_seconds),
+            );
+        }
+
+        app
+    }
+
+    fn load(&mut self) {
+        let url = self.url.trim().to_owned();
+        if url.is_empty() {
+            self.fail("Enter a URL before loading.");
+            return;
+        }
+
+        self.start_load_job(url, true, None, None);
+    }
+
+    fn start_load_job(
+        &mut self,
+        url: String,
+        fetch_playlist: bool,
+        selected_track: Option<usize>,
+        resume_position: Option<f64>,
+    ) {
+        self.stop();
+        self.load_id = self.load_id.saturating_add(1);
+        let id = self.load_id;
+        let volume = self.volume;
+        let tx = self.load_tx.clone();
+        self.loading = true;
+        if fetch_playlist {
+            self.playlist.clear();
+        }
+        self.chapters.clear();
+        self.selected_track = selected_track;
+        self.push_debug(format!("Starting background load job {id}: {url}"));
+        self.state = PlaybackState::Loading;
+        self.status = "Loading metadata and starting MPV...".to_owned();
+
+        thread::spawn(move || {
+            let (playlist, metadata_logs) = if fetch_playlist {
+                fetch_playlist_items(&url)
+            } else {
+                (
+                    Vec::new(),
+                    vec!["Skipped metadata refresh for selected queue item.".to_owned()],
+                )
+            };
+            let (chapters, chapter_logs) = fetch_chapter_items(&url);
+            let mut logs = metadata_logs;
+            logs.extend(chapter_logs);
+
+            let playback = MpvController::start(&url, volume, selected_track);
+            let _ = tx.send(LoadResult {
+                id,
+                url,
+                playlist,
+                selected_track,
+                resume_position,
+                chapters,
+                playback,
+                logs,
+            });
+        });
+    }
+
+    fn stop(&mut self) {
+        if let Some(mut mpv) = self.mpv.take() {
+            mpv.stop();
+        }
+        self.seek_position = 0.0;
+        self.time_pos = 0.0;
+        self.duration = 0.0;
+        self.user_seeking = false;
+        self.state = PlaybackState::Stopped;
+        self.status = "Stopped.".to_owned();
+        self.loading = false;
+    }
+
+    fn toggle_pause(&mut self) {
+        match self.state {
+            PlaybackState::Playing | PlaybackState::Paused => {
+                let target_pause = self.state == PlaybackState::Playing;
+                if let Some(mpv) = self.mpv.as_mut() {
+                    match mpv.set_pause(target_pause) {
+                        Ok(()) => {
+                            self.state = if target_pause {
+                                PlaybackState::Paused
+                            } else {
+                                PlaybackState::Playing
+                            };
+                            self.status = if target_pause {
+                                "Pause requested.".to_owned()
+                            } else {
+                                "Resume requested.".to_owned()
+                            };
+                        }
+                        Err(err) => self.fail(err),
+                    }
+                } else {
+                    self.state = PlaybackState::Stopped;
+                    self.status = "No active MPV process.".to_owned();
+                }
+            }
+            PlaybackState::Stopped => {
+                self.status =
+                    "Stopped. Press Load or choose a playlist item to start playback.".to_owned();
+            }
+            PlaybackState::Loading => {
+                self.status =
+                    "Still loading. Pause is unavailable until playback starts.".to_owned();
+            }
+            PlaybackState::Error => {
+                self.status = "Resolve the current error, then press Load.".to_owned();
+            }
+        }
+    }
+
+    fn command(&mut self, mpv_command: &str, success: &str) {
+        if let Some(mpv) = self.mpv.as_mut() {
+            let result = match mpv_command {
+                "playlist-prev" => mpv.playlist_prev(),
+                "playlist-next" => mpv.playlist_next(),
+                _ => Err(format!("Unsupported MPV command: {mpv_command}")),
+            };
+            match result {
+                Ok(()) => self.status = success.to_owned(),
+                Err(err) => self.fail(err),
+            }
+        } else {
+            self.status = "Load a URL first.".to_owned();
+        }
+    }
+
+    fn set_volume(&mut self) {
+        if let Some(mpv) = self.mpv.as_mut() {
+            if let Err(err) = mpv.set_volume(self.volume) {
+                self.fail(err);
+            }
+        }
+    }
+
+    fn seek(&mut self) {
+        if self.state == PlaybackState::Stopped || self.mpv.is_none() {
+            self.status = "Load a URL before seeking.".to_owned();
+            return;
+        }
+
+        if let Some(mpv) = self.mpv.as_mut() {
+            if let Err(err) = mpv.seek_absolute(self.seek_position) {
+                self.fail(err);
+                return;
+            }
+        }
+        self.status = "Seek requested.".to_owned();
+        self.time_pos = self.seek_position.max(0.0);
+    }
+
+    fn seek_chapter(&mut self, seconds: f64) {
+        self.seek_position = seconds.max(0.0);
+        self.seek();
+    }
+
+    fn poll_mpv(&mut self) {
+        self.poll_load_jobs();
+
+        if self.last_poll.elapsed() < Duration::from_millis(750) {
+            return;
+        }
+
+        self.last_poll = Instant::now();
+        let Some(mpv) = self.mpv.as_mut() else {
+            return;
+        };
+
+        let events = mpv.drain_events();
+        let exit = mpv.poll_exit();
+
+        for event in events {
+            self.handle_mpv_event(event);
+        }
+
+        match exit {
+            Ok(Some(code)) => {
+                self.mpv = None;
+                self.state = PlaybackState::Stopped;
+                self.status = format!("MPV exited with code {code}.");
+            }
+            Ok(None) => {}
+            Err(err) => self.fail(err),
+        }
+    }
+
+    fn poll_load_jobs(&mut self) {
+        while let Ok(result) = self.load_rx.try_recv() {
+            if result.id != self.load_id {
+                self.push_debug(format!("Ignored stale load job {}", result.id));
+                continue;
+            }
+
+            for log in result.logs {
+                self.push_debug(log);
+            }
+
+            self.url = result.url;
+            if !result.playlist.is_empty() {
+                self.playlist = result.playlist;
+            }
+            self.chapters = result.chapters;
+            self.selected_track = result.selected_track.or(Some(0));
+            self.loading = false;
+
+            match result.playback {
+                Ok(controller) => {
+                    self.mpv = Some(controller);
+                    if let Some(position) = result.resume_position {
+                        let position = position.max(0.0);
+                        self.seek_position = position;
+                        self.time_pos = position;
+                        if let Some(mpv) = self.mpv.as_mut() {
+                            match mpv.seek_absolute(position) {
+                                Ok(()) => self.push_debug(format!(
+                                    "Resume seek requested at {}.",
+                                    format_duration(position)
+                                )),
+                                Err(err) => self.push_debug(format!("Resume seek failed: {err}")),
+                            }
+                        }
+                    }
+                    self.state = PlaybackState::Playing;
+                    self.status = format!(
+                        "Loaded {} playlist item(s). Playback started.",
+                        self.playlist.len()
+                    );
+                }
+                Err(err) => self.fail(err),
+            }
+        }
+    }
+
+    fn handle_mpv_event(&mut self, event: MpvEvent) {
+        match event {
+            MpvEvent::State {
+                paused,
+                time_pos,
+                duration,
+                playlist_index,
+                media_title,
+            } => {
+                if let Some(value) = paused {
+                    self.state = if value {
+                        PlaybackState::Paused
+                    } else {
+                        PlaybackState::Playing
+                    };
+                }
+                if let Some(value) = duration {
+                    self.duration = value.max(0.0);
+                }
+                if let Some(value) = time_pos {
+                    self.time_pos = value.max(0.0);
+                }
+                if !self.user_seeking {
+                    self.seek_position = self.time_pos;
+                }
+                if let Some(value) = playlist_index {
+                    self.selected_track = Some(value);
+                }
+                if let Some(title) = media_title.filter(|title| !title.is_empty()) {
+                    if self.now_playing_title != title {
+                        self.now_playing_title = title;
+                        self.status = format!("Now playing: {}", self.now_playing_title);
+                    }
+                }
+            }
+            MpvEvent::NowPlaying {
+                title,
+                playlist_index,
+            } => {
+                if !title.is_empty() {
+                    self.now_playing_title = title;
+                    self.status = format!("Now playing: {}", self.now_playing_title);
+                }
+                if let Some(value) = playlist_index {
+                    self.selected_track = Some(value);
+                }
+            }
+            MpvEvent::Log(line) => self.push_debug(line),
+        }
+    }
+
+    fn play_track(&mut self, index: usize) {
+        let Some(item) = self.playlist.get(index) else {
+            return;
+        };
+        let url = item.url.clone();
+        self.url = url.clone();
+        self.selected_track = Some(index);
+        self.start_load_job(url, false, Some(index), None);
+    }
+
+    fn fail(&mut self, message: impl Into<String>) {
+        self.state = PlaybackState::Error;
+        self.status = message.into();
+        self.mpv = None;
+        self.loading = false;
+    }
+
+    fn push_debug(&mut self, line: impl Into<String>) {
+        if self.debug_logs.len() >= 120 {
+            self.debug_logs.pop_front();
+        }
+        self.debug_logs.push_back(line.into());
+    }
+
+    fn current_session_state(&self) -> Option<SessionState> {
+        let url = self.url.trim();
+        if url.is_empty() {
+            return None;
+        }
+
+        Some(SessionState {
+            current_url: url.to_owned(),
+            active_playlist_index: self.selected_track,
+            playback_position_seconds: self.time_pos.max(self.seek_position).max(0.0),
+        })
+    }
+
+    fn save_session_state(&mut self) {
+        if let Some(state) = self.current_session_state() {
+            match save_session_state(&state) {
+                Ok(()) => self.push_debug(format!("Saved playback state to {STATE_FILE}.")),
+                Err(err) => self.push_debug(format!("Failed to save playback state: {err}")),
+            }
+        }
+    }
+}
+
+impl eframe::App for PlayerApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.save_session_state();
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_mpv();
+        ctx.request_repaint_after(Duration::from_millis(250));
+        apply_style(ctx, self.opacity);
+
+        TopBottomPanel::top("display").show(ctx, |ui| {
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("MINIAMP")
+                        .size(22.0)
+                        .strong()
+                        .color(Color32::from_rgb(245, 190, 68)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_sized(
+                            [104.0, 24.0],
+                            Button::new(if self.show_debug {
+                                "Hide Debug"
+                            } else {
+                                "Toggle Debug"
+                            }),
+                        )
+                        .clicked()
+                    {
+                        self.show_debug = !self.show_debug;
+                    }
+                    ui.label(
+                        RichText::new(self.state.label())
+                            .monospace()
+                            .color(status_color(self.state)),
+                    );
+                });
+            });
+            ui.label(
+                RichText::new(&self.status)
+                    .monospace()
+                    .color(Color32::from_rgb(165, 230, 160)),
+            );
+            ui.add_space(8.0);
+        });
+
+        CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered_justified(|ui| {
+                ui.add(
+                    TextEdit::singleline(&mut self.url)
+                        .hint_text("Audio, stream, YouTube, or playlist URL")
+                        .desired_width(f32::INFINITY),
+                );
+            });
+
+            ui.add_space(10.0);
+            ui.columns(2, |columns| {
+                columns[0].vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(
+                                !self.loading,
+                                Button::new(if self.loading { "Loading" } else { "Load" }),
+                            )
+                            .clicked()
+                        {
+                            self.load();
+                        }
+                        let can_toggle =
+                            matches!(self.state, PlaybackState::Playing | PlaybackState::Paused)
+                                && self.mpv.is_some();
+                        let label = match self.state {
+                            PlaybackState::Paused => "Play",
+                            PlaybackState::Loading => "...",
+                            _ => "Pause",
+                        };
+                        if ui.add_enabled(can_toggle, Button::new(label)).clicked() {
+                            self.toggle_pause();
+                        }
+                        if ui.add_sized([72.0, 34.0], Button::new("Stop")).clicked() {
+                            self.stop();
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.add_sized([68.0, 34.0], Button::new("Prev")).clicked() {
+                            self.command("playlist-prev", "Previous track requested.");
+                        }
+                        if ui.add_sized([68.0, 34.0], Button::new("Next")).clicked() {
+                            self.command("playlist-next", "Next track requested.");
+                        }
+                    });
+
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("VOL").monospace());
+                        let changed = ui
+                            .add(Slider::new(&mut self.volume, 0.0..=100.0).show_value(true))
+                            .changed();
+                        if changed {
+                            self.set_volume();
+                        }
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("SEEK").monospace());
+                        let seek_max = self.duration.max(1.0);
+                        let response = ui.add_enabled(
+                            self.mpv.is_some(),
+                            Slider::new(&mut self.seek_position, 0.0..=seek_max)
+                                .custom_formatter(|value, _| format_duration(value))
+                                .custom_parser(|text| parse_timestamp(text)),
+                        );
+                        self.user_seeking = response.dragged();
+                        if response.drag_stopped() {
+                            self.user_seeking = false;
+                            self.seek();
+                        }
+                    });
+                    ui.label(
+                        RichText::new(format!(
+                            "{} / {}",
+                            format_duration(self.seek_position),
+                            if self.duration > 0.0 {
+                                format_duration(self.duration)
+                            } else {
+                                "--:--".to_owned()
+                            }
+                        ))
+                        .small()
+                        .monospace()
+                        .color(Color32::from_rgb(210, 215, 225)),
+                    );
+
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("OPAC").monospace());
+                        ui.add(Slider::new(&mut self.opacity, 0.45..=1.0).show_value(true));
+                    });
+
+                    if !self.now_playing_title.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(format!("Now: {}", self.now_playing_title))
+                                .monospace()
+                                .color(Color32::from_rgb(210, 215, 225)),
+                        );
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(RichText::new("Chapters").strong());
+                    ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                        if self.chapters.is_empty() {
+                            ui.label(RichText::new("No chapter markers found.").small());
+                        }
+
+                        for index in 0..self.chapters.len() {
+                            let chapter = &self.chapters[index];
+                            let label = format!(
+                                "{}  {}",
+                                format_duration(chapter.start_time),
+                                chapter.title
+                            );
+                            if ui.selectable_label(false, label).clicked() {
+                                self.seek_chapter(chapter.start_time);
+                            }
+                        }
+                    });
+                });
+
+                columns[1].vertical(|ui| {
+                    ui.label(RichText::new("Playlist").strong());
+                    ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
+                        if self.playlist.is_empty() {
+                            ui.label(RichText::new("Load a URL to render the queue.").small());
+                        }
+
+                        for index in 0..self.playlist.len() {
+                            let item = &self.playlist[index];
+                            let selected = self.selected_track == Some(index);
+                            let duration = item
+                                .duration
+                                .map(format_duration)
+                                .unwrap_or_else(|| "--:--".to_owned());
+                            let title = format!("{:02}. {}   {}", index + 1, item.title, duration);
+                            if ui
+                                .selectable_label(
+                                    selected,
+                                    RichText::new(title).color(if selected {
+                                        Color32::from_rgb(245, 190, 68)
+                                    } else {
+                                        Color32::from_rgb(220, 224, 230)
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                self.play_track(index);
+                            }
+                        }
+                    });
+                });
+            });
+
+            if self.show_debug {
+                ui.separator();
+                ui.label(RichText::new("Debug").strong());
+                ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
+                    for line in &self.debug_logs {
+                        ui.label(RichText::new(line).small().monospace());
+                    }
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.label(
+                RichText::new(format!("MPV: {MPV_PATH}"))
+                    .small()
+                    .color(Color32::from_rgb(140, 142, 150)),
+            );
+        });
+    }
+}
+
+fn fetch_playlist_items(url: &str) -> (Vec<PlaylistItem>, Vec<String>) {
+    let mut logs = vec![format!("Fetching metadata with yt-dlp: {url}")];
+    let mut playlist = Vec::new();
+
+    let mut command = hidden_command("yt-dlp");
+    let output = command
+        .args(["--flat-playlist", "--dump-json", "--no-warnings", url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for (index, line) in stdout.lines().enumerate() {
+                let Ok(item) = serde_json::from_str::<YtdlpItem>(line) else {
+                    continue;
+                };
+                let item_url = item
+                    .webpage_url
+                    .or(item.url)
+                    .unwrap_or_else(|| url.to_owned());
+                playlist.push(PlaylistItem {
+                    title: item
+                        .title
+                        .unwrap_or_else(|| format!("Track {}", index.saturating_add(1))),
+                    url: item_url,
+                    duration: item.duration,
+                });
+            }
+            logs.push(format!("yt-dlp returned {} item(s).", playlist.len()));
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            logs.push(format!("yt-dlp failed: {stderr}"));
+        }
+        Err(err) => {
+            logs.push(format!("yt-dlp unavailable: {err}"));
+        }
+    }
+
+    if playlist.is_empty() {
+        playlist.push(PlaylistItem {
+            title: url.to_owned(),
+            url: url.to_owned(),
+            duration: None,
+        });
+    }
+
+    (playlist, logs)
+}
+
+fn fetch_chapter_items(url: &str) -> (Vec<Chapter>, Vec<String>) {
+    let mut logs = vec![format!("Fetching chapter metadata: {url}")];
+    let mut chapters = Vec::new();
+
+    let mut command = hidden_command("yt-dlp");
+    let output = command
+        .args(["--dump-single-json", "--no-playlist", "--no-warnings", url])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output();
+
+    match output {
+        Ok(output) if output.status.success() => {
+            if let Ok(item) = serde_json::from_slice::<YtdlpItem>(&output.stdout) {
+                if let Some(items) = item.chapters {
+                    for (index, chapter) in items.into_iter().enumerate() {
+                        if let Some(start_time) = chapter.start_time {
+                            chapters.push(Chapter {
+                                title: chapter
+                                    .title
+                                    .unwrap_or_else(|| format!("Chapter {}", index + 1)),
+                                start_time,
+                            });
+                        }
+                    }
+                }
+            }
+            logs.push(format!("yt-dlp returned {} chapter(s).", chapters.len()));
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            logs.push(format!("chapter metadata failed: {stderr}"));
+        }
+        Err(err) => {
+            logs.push(format!("chapter metadata unavailable: {err}"));
+        }
+    }
+
+    (chapters, logs)
+}
+
+fn state_file_path() -> PathBuf {
+    PathBuf::from(STATE_FILE)
+}
+
+fn load_session_state() -> Option<SessionState> {
+    let path = state_file_path();
+    let contents = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn save_session_state(state: &SessionState) -> Result<(), String> {
+    let path = state_file_path();
+    let contents = serde_json::to_string_pretty(state)
+        .map_err(|err| format!("state serialization failed: {err}"))?;
+    fs::write(path, contents).map_err(|err| format!("state write failed: {err}"))
+}
+
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[derive(Deserialize, Serialize)]
+struct IpcResponse {
+    data: Option<serde_json::Value>,
+    error: Option<String>,
+}
+
+fn send_ipc_command(
+    ipc_path: &str,
+    command: serde_json::Value,
+) -> Result<Option<serde_json::Value>, String> {
+    let payload = json!({ "command": command }).to_string();
+    let deadline = Instant::now() + Duration::from_millis(900);
+
+    loop {
+        match OpenOptions::new().read(true).write(true).open(ipc_path) {
+            Ok(mut pipe) => {
+                writeln!(pipe, "{payload}")
+                    .map_err(|err| format!("MPV IPC command failed: {err}"))?;
+                pipe.flush()
+                    .map_err(|err| format!("MPV IPC flush failed: {err}"))?;
+
+                let mut response = String::new();
+                let mut reader = BufReader::new(pipe);
+                reader
+                    .read_line(&mut response)
+                    .map_err(|err| format!("MPV IPC response failed: {err}"))?;
+                if response.trim().is_empty() {
+                    return Ok(None);
+                }
+
+                let response: IpcResponse = serde_json::from_str(&response)
+                    .map_err(|err| format!("MPV IPC response parse failed: {err}"))?;
+                if matches!(response.error.as_deref(), Some("success") | None) {
+                    return Ok(response.data);
+                }
+                return Err(format!(
+                    "MPV IPC error: {}",
+                    response.error.unwrap_or_else(|| "unknown".to_owned())
+                ));
+            }
+            Err(err) if Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(25));
+                let _ = err;
+            }
+            Err(err) => return Err(format!("MPV IPC unavailable: {err}")),
+        }
+    }
+}
+
+fn get_ipc_property(ipc_path: &str, property: &str) -> Option<serde_json::Value> {
+    send_ipc_command(ipc_path, json!(["get_property", property]))
+        .ok()
+        .flatten()
+}
+
+fn poll_mpv_ipc(ipc_path: String, tx: mpsc::Sender<MpvEvent>) {
+    loop {
+        thread::sleep(Duration::from_millis(200));
+        let time_pos = get_ipc_property(&ipc_path, "time-pos").and_then(|value| value.as_f64());
+        let duration = get_ipc_property(&ipc_path, "duration").and_then(|value| value.as_f64());
+        let paused = get_ipc_property(&ipc_path, "pause").and_then(|value| value.as_bool());
+        let media_title = get_ipc_property(&ipc_path, "media-title")
+            .and_then(|value| value.as_str().map(ToOwned::to_owned));
+        let playlist_index = get_ipc_property(&ipc_path, "playlist-pos")
+            .and_then(|value| value.as_u64())
+            .map(|value| value as usize);
+
+        if time_pos.is_none()
+            && duration.is_none()
+            && paused.is_none()
+            && media_title.is_none()
+            && playlist_index.is_none()
+        {
+            break;
+        }
+
+        if tx
+            .send(MpvEvent::State {
+                paused,
+                time_pos,
+                duration,
+                playlist_index,
+                media_title,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn read_mpv_stream<R: std::io::Read + Send + 'static>(stream: R, tx: mpsc::Sender<MpvEvent>) {
+    let mut reader = stream;
+    let mut byte = [0_u8; 1];
+    let mut line = Vec::new();
+
+    loop {
+        let Ok(count) = reader.read(&mut byte) else {
+            break;
+        };
+        if count == 0 {
+            break;
+        }
+
+        if byte[0] == b'\r' || byte[0] == b'\n' {
+            let text = String::from_utf8_lossy(&line).trim().to_owned();
+            line.clear();
+            if !text.is_empty() {
+                let _ = tx.send(parse_mpv_line(&text));
+            }
+        } else {
+            line.push(byte[0]);
+        }
+    }
+}
+
+fn parse_mpv_line(line: &str) -> MpvEvent {
+    if let Some(rest) = line.strip_prefix("APP_STATE ") {
+        return MpvEvent::State {
+            paused: read_value(rest, "pause=").and_then(parse_mpv_bool),
+            time_pos: read_value(rest, "time=").and_then(|value| value.parse().ok()),
+            duration: read_value(rest, "duration=").and_then(|value| value.parse().ok()),
+            playlist_index: read_value(rest, "playlist=").and_then(|value| value.parse().ok()),
+            media_title: None,
+        };
+    }
+
+    if let Some(rest) = line.strip_prefix("APP_EVENT ") {
+        return MpvEvent::NowPlaying {
+            title: read_title(rest),
+            playlist_index: read_value(rest, "playlist=").and_then(|value| value.parse().ok()),
+        };
+    }
+
+    MpvEvent::Log(line.to_owned())
+}
+
+fn read_value<'a>(source: &'a str, key: &str) -> Option<&'a str> {
+    source
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix(key))
+        .filter(|value| !value.is_empty() && *value != "N/A")
+}
+
+fn read_title(source: &str) -> String {
+    source
+        .split(" playlist=")
+        .next()
+        .unwrap_or_default()
+        .strip_prefix("title=")
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+fn parse_mpv_bool(value: &str) -> Option<bool> {
+    match value {
+        "yes" | "true" => Some(true),
+        "no" | "false" => Some(false),
+        _ => None,
+    }
+}
+
+fn format_duration(duration: f64) -> String {
+    let total = duration.round().max(0.0) as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+fn parse_timestamp(text: &str) -> Option<f64> {
+    let parts = text
+        .trim()
+        .split(':')
+        .map(str::parse::<f64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+
+    match parts.as_slice() {
+        [seconds] => Some(*seconds),
+        [minutes, seconds] => Some(minutes * 60.0 + seconds),
+        [hours, minutes, seconds] => Some(hours * 3600.0 + minutes * 60.0 + seconds),
+        _ => None,
+    }
+}
+
+fn install_unicode_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "leelawadee_ui_thai".to_owned(),
+        FontData::from_static(include_bytes!(r"C:\Windows\Fonts\LeelawUI.ttf")).into(),
+    );
+
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "leelawadee_ui_thai".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .push("leelawadee_ui_thai".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
+fn apply_style(ctx: &egui::Context, opacity: f32) {
+    let alpha = (opacity.clamp(0.45, 1.0) * 255.0).round() as u8;
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = Color32::from_rgba_unmultiplied(12, 14, 18, alpha);
+    visuals.window_fill = Color32::from_rgba_unmultiplied(12, 14, 18, alpha);
+    visuals.extreme_bg_color = Color32::from_rgba_unmultiplied(4, 5, 7, alpha);
+    visuals.override_text_color = Some(Color32::from_rgb(238, 242, 248));
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(238, 242, 248));
+    visuals.widgets.inactive.bg_fill = Color32::from_rgba_unmultiplied(38, 44, 54, alpha);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgba_unmultiplied(58, 68, 82, alpha);
+    visuals.widgets.active.bg_fill = Color32::from_rgba_unmultiplied(80, 94, 112, alpha);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_rgb(245, 247, 250));
+    visuals.selection.bg_fill = Color32::from_rgb(184, 124, 32);
+    visuals.hyperlink_color = Color32::from_rgb(115, 190, 255);
+    ctx.set_visuals(visuals);
+}
+
+fn status_color(state: PlaybackState) -> Color32 {
+    match state {
+        PlaybackState::Stopped => Color32::from_rgb(180, 184, 190),
+        PlaybackState::Loading => Color32::from_rgb(245, 190, 68),
+        PlaybackState::Playing => Color32::from_rgb(120, 220, 120),
+        PlaybackState::Paused => Color32::from_rgb(120, 190, 245),
+        PlaybackState::Error => Color32::from_rgb(245, 90, 90),
+    }
+}
