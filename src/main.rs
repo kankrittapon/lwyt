@@ -236,7 +236,7 @@ struct YtdlpChapter {
 
 struct LoadResult {
     id: u64,
-    url: String,
+    original_input_url: String,
     playlist: Vec<PlaylistItem>,
     selected_track: Option<usize>,
     resume_position: Option<f64>,
@@ -247,6 +247,13 @@ struct LoadResult {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct SessionState {
+    original_input_url: String,
+    current_track_index: usize,
+    playback_position_seconds: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacySessionState {
     current_url: String,
     active_playlist_index: Option<usize>,
     playback_position_seconds: f64,
@@ -254,11 +261,13 @@ struct SessionState {
 
 struct PlayerApp {
     url: String,
+    original_input_url: String,
     state: PlaybackState,
     status: String,
     mpv: Option<MpvController>,
     volume: f32,
     seek_position: f64,
+    seek_input_buffer: String,
     time_pos: f64,
     duration: f64,
     user_seeking: bool,
@@ -269,6 +278,7 @@ struct PlayerApp {
     chapters: Vec<Chapter>,
     show_debug: bool,
     debug_logs: VecDeque<String>,
+    debug_export_logs: Vec<String>,
     opacity: f32,
     load_tx: mpsc::Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
@@ -285,11 +295,13 @@ impl PlayerApp {
         let saved_state = load_session_state();
         let mut app = Self {
             url: DEFAULT_URL.to_owned(),
+            original_input_url: DEFAULT_URL.to_owned(),
             state: PlaybackState::Stopped,
             status: "Ready. Paste an audio, stream, YouTube, or playlist URL.".to_owned(),
             mpv: None,
             volume: 70.0,
             seek_position: 0.0,
+            seek_input_buffer: format_duration(0.0),
             time_pos: 0.0,
             duration: 0.0,
             user_seeking: false,
@@ -300,6 +312,7 @@ impl PlayerApp {
             chapters: Vec::new(),
             show_debug: false,
             debug_logs: VecDeque::with_capacity(120),
+            debug_export_logs: Vec::new(),
             opacity: 1.0,
             load_tx,
             load_rx,
@@ -308,19 +321,22 @@ impl PlayerApp {
         };
 
         if let Some(state) = saved_state {
-            app.url = state.current_url.clone();
+            app.url = state.original_input_url.clone();
+            app.original_input_url = state.original_input_url.clone();
             app.seek_position = state.playback_position_seconds.max(0.0);
+            app.seek_input_buffer = format_duration(app.seek_position);
             app.time_pos = app.seek_position;
-            app.selected_track = state.active_playlist_index;
+            app.selected_track = Some(state.current_track_index);
             app.status = format!(
                 "Restoring previous session at {}...",
                 format_duration(app.seek_position)
             );
             app.start_load_job(
-                state.current_url,
+                state.original_input_url,
                 true,
-                state.active_playlist_index,
+                Some(state.current_track_index),
                 Some(state.playback_position_seconds),
+                None,
             );
         }
 
@@ -334,15 +350,17 @@ impl PlayerApp {
             return;
         }
 
-        self.start_load_job(url, true, None, None);
+        self.original_input_url = url.clone();
+        self.start_load_job(url, true, None, None, None);
     }
 
     fn start_load_job(
         &mut self,
-        url: String,
+        original_input_url: String,
         fetch_playlist: bool,
         selected_track: Option<usize>,
         resume_position: Option<f64>,
+        playback_url: Option<String>,
     ) {
         self.stop();
         self.load_id = self.load_id.saturating_add(1);
@@ -355,29 +373,53 @@ impl PlayerApp {
         }
         self.chapters.clear();
         self.selected_track = selected_track;
-        self.push_debug(format!("Starting background load job {id}: {url}"));
+        self.push_debug(format!(
+            "Starting background load job {id}: {original_input_url}"
+        ));
         self.state = PlaybackState::Loading;
         self.status = "Loading metadata and starting MPV...".to_owned();
 
         thread::spawn(move || {
             let (playlist, metadata_logs) = if fetch_playlist {
-                fetch_playlist_items(&url)
+                fetch_playlist_items(&original_input_url)
             } else {
                 (
                     Vec::new(),
                     vec!["Skipped metadata refresh for selected queue item.".to_owned()],
                 )
             };
-            let (chapters, chapter_logs) = fetch_chapter_items(&url);
+            let resolved_selected_track = selected_track.map(|index| {
+                if playlist.is_empty() {
+                    index
+                } else {
+                    index.min(playlist.len().saturating_sub(1))
+                }
+            });
+
+            let playback_uses_original_playlist = playback_url.is_none();
+            let playback_target = playback_url.unwrap_or_else(|| original_input_url.clone());
+            let chapter_target = resolved_selected_track
+                .and_then(|index| playlist.get(index))
+                .map(|item| item.url.as_str())
+                .unwrap_or(&playback_target);
+            let (chapters, chapter_logs) = fetch_chapter_items(chapter_target);
             let mut logs = metadata_logs;
             logs.extend(chapter_logs);
 
-            let playback = MpvController::start(&url, volume, selected_track);
+            let playback = MpvController::start(
+                &playback_target,
+                volume,
+                if playback_uses_original_playlist {
+                    resolved_selected_track
+                } else {
+                    None
+                },
+            );
             let _ = tx.send(LoadResult {
                 id,
-                url,
+                original_input_url,
                 playlist,
-                selected_track,
+                selected_track: resolved_selected_track,
                 resume_position,
                 chapters,
                 playback,
@@ -391,6 +433,7 @@ impl PlayerApp {
             mpv.stop();
         }
         self.seek_position = 0.0;
+        self.seek_input_buffer = format_duration(0.0);
         self.time_pos = 0.0;
         self.duration = 0.0;
         self.user_seeking = false;
@@ -468,6 +511,12 @@ impl PlayerApp {
             return;
         }
 
+        if self.duration > 0.0 {
+            self.seek_position = self.seek_position.clamp(0.0, self.duration);
+        } else {
+            self.seek_position = self.seek_position.max(0.0);
+        }
+
         if let Some(mpv) = self.mpv.as_mut() {
             if let Err(err) = mpv.seek_absolute(self.seek_position) {
                 self.fail(err);
@@ -476,6 +525,7 @@ impl PlayerApp {
         }
         self.status = "Seek requested.".to_owned();
         self.time_pos = self.seek_position.max(0.0);
+        self.seek_input_buffer = format_duration(self.seek_position);
     }
 
     fn seek_chapter(&mut self, seconds: f64) {
@@ -524,7 +574,8 @@ impl PlayerApp {
                 self.push_debug(log);
             }
 
-            self.url = result.url;
+            self.url = result.original_input_url.clone();
+            self.original_input_url = result.original_input_url;
             if !result.playlist.is_empty() {
                 self.playlist = result.playlist;
             }
@@ -538,6 +589,7 @@ impl PlayerApp {
                     if let Some(position) = result.resume_position {
                         let position = position.max(0.0);
                         self.seek_position = position;
+                        self.seek_input_buffer = format_duration(position);
                         self.time_pos = position;
                         if let Some(mpv) = self.mpv.as_mut() {
                             match mpv.seek_absolute(position) {
@@ -616,9 +668,14 @@ impl PlayerApp {
             return;
         };
         let url = item.url.clone();
-        self.url = url.clone();
         self.selected_track = Some(index);
-        self.start_load_job(url, false, Some(index), None);
+        self.start_load_job(
+            self.original_input_url.clone(),
+            false,
+            Some(index),
+            None,
+            Some(url),
+        );
     }
 
     fn fail(&mut self, message: impl Into<String>) {
@@ -629,22 +686,38 @@ impl PlayerApp {
     }
 
     fn push_debug(&mut self, line: impl Into<String>) {
+        let line = line.into();
         if self.debug_logs.len() >= 120 {
             self.debug_logs.pop_front();
         }
-        self.debug_logs.push_back(line.into());
+        self.debug_logs.push_back(line.clone());
+        self.debug_export_logs.push(line);
+    }
+
+    fn export_debug_logs(&mut self) {
+        let path = Path::new("miniamp_debug.log");
+        let contents = if self.debug_export_logs.is_empty() {
+            "No debug logs captured.\n".to_owned()
+        } else {
+            format!("{}\n", self.debug_export_logs.join("\n"))
+        };
+
+        match fs::write(path, contents) {
+            Ok(()) => self.status = format!("Exported logs to {}.", path.display()),
+            Err(err) => self.status = format!("Failed to export logs: {err}"),
+        }
     }
 
     fn current_session_state(&self) -> Option<SessionState> {
-        let url = self.url.trim();
+        let url = self.original_input_url.trim();
         if url.is_empty() {
             return None;
         }
 
         Some(SessionState {
-            current_url: url.to_owned(),
-            active_playlist_index: self.selected_track,
-            playback_position_seconds: self.time_pos.max(self.seek_position).max(0.0),
+            original_input_url: url.to_owned(),
+            current_track_index: self.selected_track.unwrap_or(0),
+            playback_position_seconds: self.time_pos.max(0.0),
         })
     }
 
@@ -765,6 +838,21 @@ impl eframe::App for PlayerApp {
                         }
                     });
 
+                    ui.label(
+                        RichText::new(format!(
+                            "Now: {} / {}",
+                            format_duration(self.time_pos),
+                            if self.duration > 0.0 {
+                                format_duration(self.duration)
+                            } else {
+                                "--:--".to_owned()
+                            }
+                        ))
+                        .small()
+                        .monospace()
+                        .color(Color32::from_rgb(210, 215, 225)),
+                    );
+
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("SEEK").monospace());
                         let seek_max = self.duration.max(1.0);
@@ -779,21 +867,24 @@ impl eframe::App for PlayerApp {
                             self.user_seeking = false;
                             self.seek();
                         }
-                    });
-                    ui.label(
-                        RichText::new(format!(
-                            "{} / {}",
-                            format_duration(self.seek_position),
-                            if self.duration > 0.0 {
-                                format_duration(self.duration)
+                        let time_response = ui.add_enabled(
+                            self.mpv.is_some(),
+                            TextEdit::singleline(&mut self.seek_input_buffer)
+                                .desired_width(72.0)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if time_response.lost_focus()
+                            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                        {
+                            if let Some(seconds) = parse_timestamp(&self.seek_input_buffer) {
+                                self.seek_position = seconds.max(0.0);
+                                self.seek();
                             } else {
-                                "--:--".to_owned()
+                                self.status =
+                                    "Invalid seek time. Use MM:SS or HH:MM:SS.".to_owned();
                             }
-                        ))
-                        .small()
-                        .monospace()
-                        .color(Color32::from_rgb(210, 215, 225)),
-                    );
+                        }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("OPAC").monospace());
@@ -865,7 +956,12 @@ impl eframe::App for PlayerApp {
 
             if self.show_debug {
                 ui.separator();
-                ui.label(RichText::new("Debug").strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Debug").strong());
+                    if ui.button("Export Logs").clicked() {
+                        self.export_debug_logs();
+                    }
+                });
                 ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
                     for line in &self.debug_logs {
                         ui.label(RichText::new(line).small().monospace());
@@ -983,7 +1079,17 @@ fn state_file_path() -> PathBuf {
 fn load_session_state() -> Option<SessionState> {
     let path = state_file_path();
     let contents = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&contents).ok()
+    if let Ok(state) = serde_json::from_str::<SessionState>(&contents) {
+        return Some(state);
+    }
+
+    serde_json::from_str::<LegacySessionState>(&contents)
+        .ok()
+        .map(|state| SessionState {
+            original_input_url: state.current_url,
+            current_track_index: state.active_playlist_index.unwrap_or(0),
+            playback_position_seconds: state.playback_position_seconds,
+        })
 }
 
 fn save_session_state(state: &SessionState) -> Result<(), String> {
