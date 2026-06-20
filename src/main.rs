@@ -340,8 +340,9 @@ impl PlayerApp {
         };
 
         if let Some(state) = saved_state {
-            app.url = state.original_input_url.clone();
-            app.original_input_url = state.original_input_url.clone();
+            let (cleaned_url, _) = extract_time_from_url(&state.original_input_url);
+            app.url = cleaned_url.clone();
+            app.original_input_url = cleaned_url.clone();
             app.seek_position = state.playback_position_seconds.max(0.0);
             app.seek_input_buffer = format_duration(app.seek_position);
             app.time_pos = app.seek_position;
@@ -351,7 +352,7 @@ impl PlayerApp {
                 format_duration(app.seek_position)
             );
             app.start_load_job(
-                state.original_input_url,
+                cleaned_url,
                 true,
                 Some(state.current_track_index),
                 Some(state.playback_position_seconds),
@@ -420,8 +421,10 @@ impl PlayerApp {
         ));
 
         thread::spawn(move || {
+            let (cleaned_input_url, extracted_time) = extract_time_from_url(&original_input_url);
+
             let (playlist, metadata_logs) = if fetch_playlist {
-                fetch_playlist_items(&original_input_url)
+                fetch_playlist_items(&cleaned_input_url)
             } else {
                 (
                     Vec::new(),
@@ -438,17 +441,20 @@ impl PlayerApp {
 
             let playback_uses_original_playlist = playback_url.is_none();
             let playback_target = playback_url.unwrap_or_else(|| original_input_url.clone());
-            
+            let (cleaned_playback_target, extracted_play_time) = extract_time_from_url(&playback_target);
+
+            let final_resume_position = resume_position.or(extracted_time).or(extracted_play_time);
+
             let (chapters, chapter_logs, playback) = if append_to_queue {
                 (Vec::new(), Vec::new(), Err("Queue append mode".to_owned()))
             } else {
                 let chapter_target = resolved_selected_track
                     .and_then(|index| playlist.get(index))
                     .map(|item| item.url.as_str())
-                    .unwrap_or(&playback_target);
+                    .unwrap_or(&cleaned_playback_target);
                 let (chaps, chaps_logs) = fetch_chapter_items(chapter_target);
                 let pb = MpvController::start(
-                    &playback_target,
+                    &cleaned_playback_target,
                     volume,
                     if playback_uses_original_playlist {
                         resolved_selected_track
@@ -464,10 +470,10 @@ impl PlayerApp {
 
             let _ = tx.send(LoadResult {
                 id,
-                original_input_url,
+                original_input_url: cleaned_input_url,
                 playlist,
                 selected_track: resolved_selected_track,
-                resume_position,
+                resume_position: final_resume_position,
                 chapters,
                 playback,
                 logs,
