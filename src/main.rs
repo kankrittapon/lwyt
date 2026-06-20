@@ -1428,15 +1428,16 @@ fn poll_mpv_ipc(ipc_path: String, tx: mpsc::Sender<MpvEvent>) {
     loop {
         thread::sleep(Duration::from_millis(200));
 
-        // Fast-path check: If getting time-pos fails (e.g. pipe is gone or MPV closed),
-        // exit the thread immediately to avoid blocking on remaining queries.
-        let Some(time_val) = send_ipc_command(&ipc_path, json!(["get_property", "time-pos"])).ok().flatten() else {
+        // Fast-path check: Test connection using "pause" property. If the IPC command returns Err,
+        // it means the Named Pipe is gone or MPV is closed, so we break the loop immediately.
+        let pause_result = send_ipc_command(&ipc_path, json!(["get_property", "pause"]));
+        if pause_result.is_err() {
             break;
-        };
-        let time_pos = time_val.as_f64();
+        }
+        let paused = pause_result.ok().flatten().and_then(|v| v.as_bool());
 
+        let time_pos = get_ipc_property(&ipc_path, "time-pos").and_then(|value| value.as_f64());
         let duration = get_ipc_property(&ipc_path, "duration").and_then(|value| value.as_f64());
-        let paused = get_ipc_property(&ipc_path, "pause").and_then(|value| value.as_bool());
         let media_title = get_ipc_property(&ipc_path, "media-title")
             .and_then(|value| value.as_str().map(ToOwned::to_owned));
         let playlist_index = get_ipc_property(&ipc_path, "playlist-pos")
