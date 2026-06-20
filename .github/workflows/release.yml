@@ -38,7 +38,9 @@ jobs:
         run: cargo build --release
 
       - name: Install WiX Toolset
-        run: dotnet tool install --global wix
+        run: |
+          dotnet tool install --global wix
+          wix eula accept wix7
 
       - name: Build MSI Installer
         run: wix build installer.wxs -o target/release/LightweightAudioPlayer.msi
