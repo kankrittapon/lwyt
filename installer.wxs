@@ -6,7 +6,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="LYTBokkChoYx" 
            Manufacturer="kankrittapon" 
-           Version="0.1.0" 
+           Version="$(var.Version)" 
            UpgradeCode="4e5781a3-2391-4c6e-8260-84cfc813589b" 
            Language="1033">
            

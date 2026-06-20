@@ -2,7 +2,9 @@
 ; Download Inno Setup Compiler from: https://jrsoftware.org/isdl.php
 
 #define MyAppName "LYTBokkChoYx"
-#define MyAppVersion "0.1.0"
+#ifndef MyAppVersion
+  #define MyAppVersion "0.1.0"
+#endif
 #define MyAppPublisher "kankrittapon"
 #define MyAppURL "https://github.com/kankrittapon/lwyt"
 #define MyAppExeName "lytbokkchoyx.exe"

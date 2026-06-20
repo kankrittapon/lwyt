@@ -34,17 +34,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build Application (Release)
-        run: cargo build --release
-
       - name: Install WiX Toolset
         run: |
           dotnet tool install --global wix
           wix eula accept wix7
 
-      - name: Build MSI Installer
-        run: wix build installer.wxs -o target/release/LYTBokkChoYx.msi
-        shell: pwsh
+      - name: Run Build and Packaging Script
+        run: powershell -ExecutionPolicy Bypass -File ./build.ps1
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -52,6 +48,7 @@ jobs:
           name: "Release ${{ github.ref_name }}"
           files: |
             target/release/LYTBokkChoYx.msi
+            target/release/LYTBokkChoYx_Setup.exe
             target/release/lytbokkchoyx.exe
           draft: false
           prerelease: false
