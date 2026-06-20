@@ -207,6 +207,7 @@ enum MpvEvent {
         playlist_index: Option<usize>,
     },
     Log(String),
+    IpcError(String),
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +300,7 @@ struct PlayerApp {
     history: Vec<HistoryItem>,
     active_tab: usize,
     last_history_save: Instant,
+    reconnect_attempts: usize,
 }
 
 impl PlayerApp {
@@ -337,6 +339,7 @@ impl PlayerApp {
             history,
             active_tab: 0,
             last_history_save: Instant::now(),
+            reconnect_attempts: 0,
         };
 
         if let Some(state) = saved_state {
@@ -365,6 +368,7 @@ impl PlayerApp {
     }
 
     fn load(&mut self) {
+        self.reconnect_attempts = 0;
         let url = self.url.trim().to_owned();
         if url.is_empty() {
             self.fail("Enter a URL before loading.");
@@ -483,6 +487,17 @@ impl PlayerApp {
     }
 
     fn stop(&mut self) {
+        // Save current track progress to history before clearing state
+        if self.state == PlaybackState::Playing || self.state == PlaybackState::Paused {
+            if self.time_pos > 0.0 {
+                if let Some(track_idx) = self.selected_track {
+                    if let Some(item) = self.playlist.get(track_idx).cloned() {
+                        self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                    }
+                }
+            }
+        }
+
         if let Some(mut mpv) = self.mpv.take() {
             mpv.stop();
         }
@@ -622,17 +637,61 @@ impl PlayerApp {
         match exit {
             Ok(Some(code)) => {
                 self.mpv = None;
-                self.state = PlaybackState::Stopped;
-                self.status = format!("MPV exited with code {code}.");
+                
+                // Save current position before resetting
+                if self.time_pos > 0.0 {
+                    if let Some(track_idx) = self.selected_track {
+                        if let Some(item) = self.playlist.get(track_idx).cloned() {
+                            self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                        }
+                    }
+                }
 
-                // Auto-advance: Play next track if playing finished successfully
                 if code == 0 {
+                    self.state = PlaybackState::Stopped;
+                    self.status = format!("MPV exited with code {code}.");
+                    // Auto-advance: Play next track if playing finished successfully
                     if let Some(current_idx) = self.selected_track {
                         let next_idx = current_idx + 1;
                         if next_idx < self.playlist.len() {
                             self.play_track(next_idx);
                         }
                     }
+                } else {
+                    // MPV exited with non-zero code. Attempt to reconnect if we were playing/paused.
+                    if self.state == PlaybackState::Playing || self.state == PlaybackState::Paused {
+                        if self.reconnect_attempts < 3 {
+                            if let Some(current_idx) = self.selected_track {
+                                if let Some(item) = self.playlist.get(current_idx).cloned() {
+                                    self.reconnect_attempts += 1;
+                                    self.status = format!(
+                                        "MPV exited unexpectedly. Reconnecting (attempt {}/3)...",
+                                        self.reconnect_attempts
+                                    );
+                                    self.push_debug(format!(
+                                        "Auto-reconnecting to {} at position {}s...",
+                                        item.url, self.time_pos
+                                    ));
+                                    
+                                    let resume_pos = Some(self.time_pos);
+                                    self.start_load_job(
+                                        self.original_input_url.clone(),
+                                        false,
+                                        Some(current_idx),
+                                        resume_pos,
+                                        Some(item.url),
+                                        false,
+                                    );
+                                    return;
+                                }
+                            }
+                        } else {
+                            self.fail("MPV exited unexpectedly. Maximum reconnection attempts reached.");
+                            return;
+                        }
+                    }
+                    self.state = PlaybackState::Stopped;
+                    self.status = format!("MPV exited with code {code}.");
                 }
             }
             Ok(None) => {}
@@ -683,6 +742,7 @@ impl PlayerApp {
 
             match result.playback {
                 Ok(controller) => {
+                    self.reconnect_attempts = 0; // Successfully established connection to a new MPV instance
                     self.mpv = Some(controller);
                     if let Some(position) = result.resume_position {
                         let position = position.max(0.0);
@@ -768,10 +828,57 @@ impl PlayerApp {
                 }
             }
             MpvEvent::Log(line) => self.push_debug(line),
+            MpvEvent::IpcError(err) => {
+                self.push_debug(format!("MPV IPC connection lost: {err}"));
+                
+                // Save current position immediately
+                if self.time_pos > 0.0 {
+                    if let Some(track_idx) = self.selected_track {
+                        if let Some(item) = self.playlist.get(track_idx).cloned() {
+                            self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                        }
+                    }
+                }
+
+                if self.state == PlaybackState::Playing || self.state == PlaybackState::Paused {
+                    if self.reconnect_attempts < 3 {
+                        if let Some(current_idx) = self.selected_track {
+                            if let Some(item) = self.playlist.get(current_idx).cloned() {
+                                self.reconnect_attempts += 1;
+                                self.status = format!(
+                                    "IPC connection lost. Reconnecting (attempt {}/3)...",
+                                    self.reconnect_attempts
+                                );
+                                self.push_debug(format!(
+                                    "Auto-reconnecting to {} at position {}s...",
+                                    item.url, self.time_pos
+                                ));
+                                
+                                let resume_pos = Some(self.time_pos);
+                                self.start_load_job(
+                                    self.original_input_url.clone(),
+                                    false,
+                                    Some(current_idx),
+                                    resume_pos,
+                                    Some(item.url),
+                                    false,
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        self.fail("MPV connection lost. Maximum reconnection attempts reached.");
+                    }
+                }
+                
+                // If not playing/paused or no reconnect was triggered, stop MPV controller cleanly
+                self.stop();
+            }
         }
     }
 
     fn play_track(&mut self, index: usize) {
+        self.reconnect_attempts = 0;
         let Some(item) = self.playlist.get(index) else {
             return;
         };
@@ -1437,7 +1544,8 @@ fn poll_mpv_ipc(ipc_path: String, tx: mpsc::Sender<MpvEvent>) {
         // Fast-path check: Test connection using "pause" property. If the IPC command returns Err,
         // it means the Named Pipe is gone or MPV is closed, so we break the loop immediately.
         let pause_result = send_ipc_command(&ipc_path, json!(["get_property", "pause"]));
-        if pause_result.is_err() {
+        if let Err(err) = pause_result {
+            let _ = tx.send(MpvEvent::IpcError(err));
             break;
         }
         let paused = pause_result.ok().flatten().and_then(|v| v.as_bool());

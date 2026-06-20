@@ -11,9 +11,9 @@ A highly optimized, ultra-lightweight audio player written in Rust using the `ef
 - **Winamp-Inspired Minimalist UI:** Classic styling with transparency support.
 - **Smart Play Queue Manager:** Add URLs or playlists to the queue seamlessly in the background without interrupting current playback. You can reorder items (🔼/🔽), remove them (❌), or clear the queue.
 - **Auto-Advance Playback:** Automatically transitions to the next track in the queue when the current song finishes.
-- **History Tracker & Auto-Resume:** Tracks your listening history (saves up to 100 items to `history.json` to keep RAM under 2MB). It remembers the last playback position for each unique URL and automatically resumes from where you left off.
+- **History Tracker & State Persistence:** Tracks listening history (up to 100 items saved to `history.json` to keep RAM under 2MB). It remembers the last playback position for each unique URL and automatically resumes from where you left off, even if the application is reopened.
 - **Time Parsing from URL:** Paste YouTube links containing timestamp parameters (e.g., `&t=1h30m5s` or `?t=4500s`). The player strips it cleanly to prevent playback conflicts and resumes play at the correct timestamp.
-- **Robust Windows IPC Handling:** Uses fast-path exit named pipe configurations to prevent background zombie threads and program freezes upon reopening.
+- **Robust Windows IPC & Auto-Reconnection:** Uses fast-path named pipe checking to avoid zombie processes. If the IPC named pipe is disconnected or MPV crashes unexpectedly, it automatically reconnects and resumes playback from the last known time position.
 
 ---
 
