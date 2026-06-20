@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- 📜 WiX Toolset v4/v5 Script for Lightweight Audio Player (MINIAMP) -->
+<!-- 📜 WiX Toolset v4/v5 Script for LYTBokkChoYx -->
 <!-- Download WiX Toolset v4/v5 Compiler from: https://wixtoolset.org -->
-<!-- Build command: wix build installer.wxs -o LightweightAudioPlayer.msi -->
+<!-- Build command: wix build installer.wxs -o LYTBokkChoYx.msi -->
 
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Lightweight Audio Player" 
+  <Package Name="LYTBokkChoYx" 
            Manufacturer="kankrittapon" 
            Version="0.1.0" 
            UpgradeCode="4e5781a3-2391-4c6e-8260-84cfc813589b" 
@@ -15,13 +15,12 @@
     <!-- Icon for Add/Remove Programs -->
     <Property Id="ARPPRODUCTICON" Value="AppIcon" />
 
-    <!-- 1. Define standard directories for installation -->
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="INSTALLFOLDER" Name="Lightweight Audio Player" />
+      <Directory Id="INSTALLFOLDER" Name="LYTBokkChoYx" />
     </StandardDirectory>
 
     <StandardDirectory Id="ProgramMenuFolder">
-      <Directory Id="ApplicationProgramsFolder" Name="Lightweight Audio Player" />
+      <Directory Id="ApplicationProgramsFolder" Name="LYTBokkChoYx" />
     </StandardDirectory>
 
     <StandardDirectory Id="DesktopFolder" />
@@ -31,15 +30,15 @@
       
       <!-- Main Executable, Start Menu Shortcut, and Desktop Shortcut -->
       <Component Id="MainExecutable" Guid="3a5b3de1-a790-482f-897d-411a7a0cd4bb">
-        <File Id="AppExe" Source="target\release\lightweight_audio_player.exe" KeyPath="yes">
+        <File Id="AppExe" Source="target\release\lytbokkchoyx.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" 
                     Directory="ApplicationProgramsFolder" 
-                    Name="Lightweight Audio Player" 
+                    Name="LYTBokkChoYx" 
                     WorkingDirectory="INSTALLFOLDER" 
                     Advertise="yes" />
           <Shortcut Id="DesktopShortcut" 
                     Directory="DesktopFolder" 
-                    Name="Lightweight Audio Player" 
+                    Name="LYTBokkChoYx" 
                     WorkingDirectory="INSTALLFOLDER" 
                     Advertise="yes" />
         </File>
@@ -56,7 +55,7 @@
     </ComponentGroup>
 
     <!-- 3. Assign components to Features -->
-    <Feature Id="MainFeature" Title="Lightweight Audio Player Setup" Level="1">
+    <Feature Id="MainFeature" Title="LYTBokkChoYx Setup" Level="1">
       <ComponentGroupRef Id="ProductComponents" />
     </Feature>
   </Package>

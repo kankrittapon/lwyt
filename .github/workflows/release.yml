@@ -43,7 +43,7 @@ jobs:
           wix eula accept wix7
 
       - name: Build MSI Installer
-        run: wix build installer.wxs -o target/release/LightweightAudioPlayer.msi
+        run: wix build installer.wxs -o target/release/LYTBokkChoYx.msi
         shell: pwsh
 
       - name: Create GitHub Release
@@ -51,8 +51,8 @@ jobs:
         with:
           name: "Release ${{ github.ref_name }}"
           files: |
-            target/release/LightweightAudioPlayer.msi
-            target/release/lightweight_audio_player.exe
+            target/release/LYTBokkChoYx.msi
+            target/release/lytbokkchoyx.exe
           draft: false
           prerelease: false
         env:

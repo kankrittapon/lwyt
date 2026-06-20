@@ -1,4 +1,4 @@
-# Lightweight Audio Player (MINIAMP)
+# LYTBokkChoYx
 
 A highly optimized, ultra-lightweight audio player written in Rust using the `eframe` (egui) GUI framework. It controls `mpv` player in the background via Windows Named Pipe IPC to stream audio from YouTube, online streams, or local files with a strict focus on minimizing PC RAM usage.
 
@@ -37,7 +37,7 @@ cargo run
 cargo build --release
 ```
 
-The compiled release binary will be available at `target/release/lightweight_audio_player.exe`.
+The compiled release binary will be available at `target/release/lytbokkchoyx.exe`.
 
 ---
 
@@ -56,7 +56,7 @@ This repository is configured with a GitHub Actions workflow (`.github/workflows
 ### 2. WiX Toolset Installer (.MSI)
 A WiX v4/v5 script ([installer.wxs](installer.wxs)) is available in the root directory to generate standard MSI packages.
 ```bash
-wix build installer.wxs -o LightweightAudioPlayer.msi
+wix build installer.wxs -o LYTBokkChoYx.msi
 ```
 
 ### 3. Inno Setup Installer (.EXE with dependency checks)
@@ -78,7 +78,7 @@ An Inno Setup script ([installer.iss](installer.iss)) is provided. It compiles a
 
 ## 🇹🇭 คู่มือการใช้งานภาษาไทย
 
-**MINIAMP** คือเครื่องเล่นเพลงขนาดเล็กพิเศษ เขียนด้วยภาษา Rust โดยจำกัดการใช้ RAM ขั้นสุด
+**LYTBokkChoYx** คือเครื่องเล่นเพลงขนาดเล็กพิเศษ เขียนด้วยภาษา Rust โดยจำกัดการใช้ RAM ขั้นสุด
 
 ### การติดตั้งและใช้งาน
 1. ติดตั้งโปรแกรม **MPV Player** ไว้ที่พาธ: `C:\Program Files\MPV Player\mpv.exe`

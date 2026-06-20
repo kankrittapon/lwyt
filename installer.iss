@@ -1,11 +1,11 @@
-; 📜 Inno Setup Script for Lightweight Audio Player (MINIAMP)
+; 📜 Inno Setup Script for LYTBokkChoYx
 ; Download Inno Setup Compiler from: https://jrsoftware.org/isdl.php
 
-#define MyAppName "Lightweight Audio Player"
+#define MyAppName "LYTBokkChoYx"
 #define MyAppVersion "0.1.0"
 #define MyAppPublisher "kankrittapon"
 #define MyAppURL "https://github.com/kankrittapon/lwyt"
-#define MyAppExeName "lightweight_audio_player.exe"
+#define MyAppExeName "lytbokkchoyx.exe"
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application. Do not use the same AppId value in installers for other applications.
@@ -23,7 +23,7 @@ DefaultGroupName={#MyAppName}
 AllowNoIcons=yes
 ; Save the setup executable in the current directory
 OutputDir=.
-OutputBaseFilename=LightweightAudioPlayer_Setup
+OutputBaseFilename=LYTBokkChoYx_Setup
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
@@ -103,7 +103,7 @@ begin
     begin
       SuppressibleMsgBox(
         '⚠️ Missing Dependencies Detected!' + #13#10#10 +
-        'Lightweight Audio Player requires additional software to work properly:' + #13#10#10 +
+        'LYTBokkChoYx requires additional software to work properly:' + #13#10#10 +
         WarningMsg +
         'Please refer to the README.txt file in the install directory for more details.',
         mbWarning, MB_OK, MB_OK

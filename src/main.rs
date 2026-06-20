@@ -31,7 +31,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: ViewportBuilder::default()
-            .with_title("Lightweight Audio Player")
+            .with_title("LYTBokkChoYx")
             .with_inner_size(Vec2::new(760.0, 520.0))
             .with_min_inner_size(Vec2::new(600.0, 420.0))
             .with_resizable(true)
@@ -40,7 +40,7 @@ fn main() -> eframe::Result {
     };
 
     let _result = eframe::run_native(
-        "Lightweight Audio Player",
+        "LYTBokkChoYx",
         options,
         Box::new(|cc| Ok(Box::new(PlayerApp::new(cc)))),
     );
@@ -89,7 +89,7 @@ impl MpvController {
             return Err(format!("MPV was not found at {MPV_PATH}"));
         }
 
-        let ipc_path = format!(r"\\.\pipe\miniamp-{}-{}", std::process::id(), unique_id());
+        let ipc_path = format!(r"\\.\pipe\lytbokkchoyx-{}-{}", std::process::id(), unique_id());
         let ipc_arg = format!("--input-ipc-server={ipc_path}");
         let mut args = vec![
             "--no-video".to_owned(),
@@ -912,7 +912,7 @@ impl PlayerApp {
     }
 
     fn export_debug_logs(&mut self) {
-        let path = Path::new("miniamp_debug.log");
+        let path = Path::new("lytbokkchoyx_debug.log");
         let contents = if self.debug_export_logs.is_empty() {
             "No debug logs captured.\n".to_owned()
         } else {
@@ -964,7 +964,7 @@ impl eframe::App for PlayerApp {
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new("MINIAMP")
+                    RichText::new("LYTBokkChoYx")
                         .size(22.0)
                         .strong()
                         .color(Color32::from_rgb(245, 190, 68)),
