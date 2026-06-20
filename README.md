@@ -27,9 +27,7 @@ To run this application, you must have the following installed on your Windows s
 
 ---
 
-## 🚀 How to Run
-
-Clone the repository and run the following command in your terminal:
+## 📦 How to Build & Run Locally
 
 ```bash
 # Run in development mode
@@ -40,6 +38,29 @@ cargo build --release
 ```
 
 The compiled release binary will be available at `target/release/lightweight_audio_player.exe`.
+
+---
+
+## 🚀 Deployment & Installation (.MSI / .EXE Setup)
+
+The project includes setup configurations to easily package and distribute the player without manual configuration:
+
+### 1. GitHub Actions CI/CD (Recommended)
+This repository is configured with a GitHub Actions workflow (`.github/workflows/release.yml`). It automatically compiles the Rust binary, generates the `.msi` installer, and publishes them as a GitHub Release:
+- Just push a new version tag (e.g., `v0.1.0`):
+  ```bash
+  git tag v0.1.0
+  git push origin master --tags
+  ```
+
+### 2. WiX Toolset Installer (.MSI)
+A WiX v4/v5 script ([installer.wxs](installer.wxs)) is available in the root directory to generate standard MSI packages.
+```bash
+wix build installer.wxs -o LightweightAudioPlayer.msi
+```
+
+### 3. Inno Setup Installer (.EXE with dependency checks)
+An Inno Setup script ([installer.iss](installer.iss)) is provided. It compiles a standard setup file and includes automated checks at the end of the installation to verify if `mpv.exe` and `yt-dlp` are installed in the user's system PATH.
 
 ---
 
@@ -59,21 +80,8 @@ The compiled release binary will be available at `target/release/lightweight_aud
 
 **MINIAMP** คือเครื่องเล่นเพลงขนาดเล็กพิเศษ เขียนด้วยภาษา Rust โดยจำกัดการใช้ RAM ขั้นสุด
 
-### การติดตั้งและสิ่งจำเป็น
-1. ติดตั้งภาษา **Rust**
-2. ติดตั้งโปรแกรม **MPV Player** ไว้ที่พาธ: `C:\Program Files\MPV Player\mpv.exe`
-3. ติดตั้ง **yt-dlp** และทำการเพิ่มลงใน PATH ของ Windows เพื่อดึงข้อมูลสตรีมและรายชื่อเพลง
-
-### การสั่งรันโปรแกรม
-เปิด Git Bash หรือ Terminal ในโฟลเดอร์โปรเจกต์แล้วรัน:
-```bash
-# สั่งรันโปรแกรมทันที
-cargo run
-
-# สั่งสร้างไฟล์โปรแกรมสำหรับนำไปใช้งาน (.exe)
-cargo build --release
-```
-
-### ฟังก์ชันพิเศษของระบบ
-*   **ระบบจดจำตำแหน่งประวัติ:** ตัวโปรแกรมจะบันทึกประวัติการฟังไว้ในไฟล์ `history.json` (สูงสุด 100 รายการเพื่อไม่ให้บวมแรม) และจะจดจำเวลาเล่นค้างล่าสุดของแต่ละ URL เมื่อคุณเปิดเพลงเดิมอีกครั้ง มันจะเล่นต่อจากจุดเดิมให้อัตโนมัติ
-*   **ระบบคิวเล่นเพลง (Play Queue):** สามารถป้อนลิงก์แล้วกด `+ Queue` เพื่อโหลดรายชื่อเพลงมาต่อท้ายคิวได้เรื่อยๆ โดยระบบจะสตรีมเพลงถัดไปให้อัตโนมัติเมื่อเพลงก่อนหน้าจบลง
+### การติดตั้งและใช้งาน
+1. ติดตั้งโปรแกรม **MPV Player** ไว้ที่พาธ: `C:\Program Files\MPV Player\mpv.exe`
+2. ติดตั้ง **yt-dlp** และทำการเพิ่มลงใน PATH ของ Windows
+3. สั่งรันด้วยคำสั่ง `cargo run` หรือแพ็คตัวติดตั้งด้วย Inno Setup / WiX Toolset
+4. หากคุณทำการอัปโหลดโค้ดขึ้น GitHub และสร้าง Tag ระบบ GitHub Actions จะทำหน้าที่คอมไพล์และสร้างไฟล์ติดตั้งแบบ `.msi` ส่งออกมาให้ดาวน์โหลดโดยอัตโนมัติ!
