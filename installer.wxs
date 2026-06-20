@@ -31,7 +31,7 @@
       
       <!-- Main Executable, Start Menu Shortcut, and Desktop Shortcut -->
       <Component Id="MainExecutable" Guid="3a5b3de1-a790-482f-897d-411a7a0cd4bb">
-        <File Id="AppExe" Source="E:\WorkSpace\target\release\lightweight_audio_player.exe" KeyPath="yes">
+        <File Id="AppExe" Source="target\release\lightweight_audio_player.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut" 
                     Directory="ApplicationProgramsFolder" 
                     Name="Lightweight Audio Player" 
@@ -50,7 +50,7 @@
 
       <!-- README Document Component -->
       <Component Id="Documentation" Guid="a7a1c720-6d4b-4b17-a068-d0df3f0b2f5a">
-        <File Id="ReadmeMd" Source="E:\WorkSpace\README.md" KeyPath="yes" />
+        <File Id="ReadmeMd" Source="README.md" KeyPath="yes" />
       </Component>
       
     </ComponentGroup>

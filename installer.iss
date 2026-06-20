@@ -36,8 +36,8 @@ Name: "thai"; MessagesFile: "compiler:Languages\Thai.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-Source: "E:\WorkSpace\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "E:\WorkSpace\README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
+Source: "target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion isreadme
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
