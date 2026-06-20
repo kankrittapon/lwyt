@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- 📜 WiX Toolset v4/v5 Script for Lightweight Audio Player (MINIAMP) -->
+<!-- Download WiX Toolset v4/v5 Compiler from: https://wixtoolset.org -->
+<!-- Build command: wix build installer.wxs -o LightweightAudioPlayer.msi -->
+
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Lightweight Audio Player" 
+           Manufacturer="kankrittapon" 
+           Version="0.1.0" 
+           UpgradeCode="4e5781a3-2391-4c6e-8260-84cfc813589b" 
+           Language="1033">
+           
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <!-- Icon for Add/Remove Programs -->
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+
+    <!-- 1. Define standard directories for installation -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Lightweight Audio Player" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="Lightweight Audio Player" />
+    </StandardDirectory>
+
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- 2. Package components and files -->
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      
+      <!-- Main Executable, Start Menu Shortcut, and Desktop Shortcut -->
+      <Component Id="MainExecutable" Guid="3a5b3de1-a790-482f-897d-411a7a0cd4bb">
+        <File Id="AppExe" Source="E:\WorkSpace\target\release\lightweight_audio_player.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut" 
+                    Directory="ApplicationProgramsFolder" 
+                    Name="Lightweight Audio Player" 
+                    WorkingDirectory="INSTALLFOLDER" 
+                    Advertise="yes" />
+          <Shortcut Id="DesktopShortcut" 
+                    Directory="DesktopFolder" 
+                    Name="Lightweight Audio Player" 
+                    WorkingDirectory="INSTALLFOLDER" 
+                    Advertise="yes" />
+        </File>
+        
+        <!-- Force removal of the shortcut folder on uninstall -->
+        <RemoveFolder Id="CleanupShortcutFolder" Directory="ApplicationProgramsFolder" On="uninstall" />
+      </Component>
+
+      <!-- README Document Component -->
+      <Component Id="Documentation" Guid="a7a1c720-6d4b-4b17-a068-d0df3f0b2f5a">
+        <File Id="ReadmeMd" Source="E:\WorkSpace\README.md" KeyPath="yes" />
+      </Component>
+      
+    </ComponentGroup>
+
+    <!-- 3. Assign components to Features -->
+    <Feature Id="MainFeature" Title="Lightweight Audio Player Setup" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+  </Package>
+</Wix>
