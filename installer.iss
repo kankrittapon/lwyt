@@ -55,15 +55,11 @@ Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChang
 // Helper function to check if a command executable is available in system PATH
 function IsInPath(const ExecutableName: String): Boolean;
 var
-  Cmd, Output: String;
+  Cmd: String;
   ResultCode: Integer;
-  TempFile: String;
 begin
-  TempFile := ExpandConstant('{tmp}\path_check.txt');
-  Cmd := 'where ' + ExecutableName + ' > "' + TempFile + '" 2>&1';
-  
-  // Executing cmd.exe silently to search for executable in PATH
-  if Executedos(Cmd, ResultCode) and (ResultCode = 0) then
+  Cmd := '/c where ' + ExecutableName + ' >nul 2>nul';
+  if Exec(ExpandConstant('{cmd}'), Cmd, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
     Result := True
   else
     Result := False;
