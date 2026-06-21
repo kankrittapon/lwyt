@@ -106,7 +106,7 @@ begin
         'LYTBokkChoYx requires additional software to work properly:' + #13#10#10 +
         WarningMsg +
         'Please refer to the README.txt file in the install directory for more details.',
-        mbWarning, MB_OK, MB_OK
+        mbInformation, MB_OK, MB_OK
       );
     end;
   end;
