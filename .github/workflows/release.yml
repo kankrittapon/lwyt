@@ -41,10 +41,12 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install WiX Toolset
+        continue-on-error: true
         shell: pwsh
         run: dotnet tool install --global wix
 
       - name: Install Inno Setup
+        continue-on-error: true
         shell: pwsh
         run: choco install innosetup --no-progress -y
 
@@ -56,7 +58,7 @@ jobs:
 
       - name: Run Build and Packaging Script
         shell: pwsh
-        run: ./build.ps1 -RequireInstallers
+        run: ./build.ps1
 
       - name: Upload Build Artifacts
         uses: actions/upload-artifact@v4

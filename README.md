@@ -94,6 +94,11 @@ An Inno Setup script ([installer.iss](installer.iss)) is provided. It compiles a
 
 ## Changelog
 
+### 0.2.3 - 2026-06-21
+
+- Made the portable Windows executable the required release artifact.
+- Made MSI and Setup packaging optional so temporary installer-tool failures cannot block application releases.
+
 ### 0.2.0 - 2026-06-21
 
 - Added authenticated remote queue delivery through `player-api.kankrittapon.online`.
