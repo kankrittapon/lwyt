@@ -1,3 +1,7 @@
+param(
+    [switch]$RequireInstallers
+)
+
 $ErrorActionPreference = "Stop"
 
 Write-Host "Reading version from Cargo.toml..."
@@ -10,7 +14,7 @@ $version = $versionLine.ToString().Split([char]34)[1]
 Write-Host "Version detected: $version"
 
 Write-Host "Building LYTBokkChoYx in Release mode..."
-cargo build --release
+cargo build --release --locked
 
 # Ensure output directory exists
 $targetReleaseDir = "target/release"
@@ -21,11 +25,11 @@ if (!(Test-Path $targetReleaseDir)) {
 # 1. Build WiX MSI Installer
 Write-Host "Building MSI Installer via WiX Toolset..."
 if (Get-Command wix -ErrorAction SilentlyContinue) {
-    # Accept EULA for WiX v7
     wix eula accept wix7 2>$null | Out-Null
     wix build installer.wxs -d Version="$version" -o "$targetReleaseDir/LYTBokkChoYx.msi"
     Write-Host "MSI Installer created: $targetReleaseDir/LYTBokkChoYx.msi"
 } else {
+    if ($RequireInstallers) { throw "wix command not found" }
     Write-Warning "wix command not found. Skipping MSI build."
 }
 
@@ -39,6 +43,7 @@ if (Test-Path $isccPath) {
     & ISCC.exe /DMyAppVersion="$version" installer.iss
     Write-Host "EXE Installer created: LYTBokkChoYx_Setup.exe"
 } else {
+    if ($RequireInstallers) { throw "Inno Setup compiler (ISCC.exe) not found" }
     Write-Warning "Inno Setup compiler (ISCC.exe) not found. Skipping EXE build."
 }
 
@@ -54,10 +59,18 @@ if (Test-Path "$targetReleaseDir/LYTBokkChoYx.msi") {
     Write-Host "WiX MSI Installer: $targetReleaseDir/LYTBokkChoYx.msi [OK]"
 }
 
+if ($RequireInstallers -and !(Test-Path "$targetReleaseDir/LYTBokkChoYx.msi")) {
+    throw "MSI installer was not generated"
+}
+
 if (Test-Path "LYTBokkChoYx_Setup.exe") {
     # Move EXE setup to target/release to match release workflow and clean up root directory
     Move-Item -Path "LYTBokkChoYx_Setup.exe" -Destination "$targetReleaseDir/LYTBokkChoYx_Setup.exe" -Force
     Write-Host "Inno Setup EXE: $targetReleaseDir/LYTBokkChoYx_Setup.exe [OK]"
+}
+
+if ($RequireInstallers -and !(Test-Path "$targetReleaseDir/LYTBokkChoYx_Setup.exe")) {
+    throw "EXE installer was not generated"
 }
 
 Write-Host "All tasks completed successfully on local machine!"

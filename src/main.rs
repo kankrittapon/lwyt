@@ -3,7 +3,8 @@
 use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::mpsc::{self, Receiver},
@@ -25,6 +26,7 @@ const MPV_PATH: &str = r"C:\Program Files\MPV Player\mpv.exe";
 const DEFAULT_URL: &str =
     "https://www.youtube.com/watch?v=liTj2cga-X8&list=PLTubEPwWLaT7_rDszOkDaj57rF02u3SZu";
 const STATE_FILE: &str = "config.json";
+const API_PORT: u16 = 9733;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -34,8 +36,7 @@ fn main() -> eframe::Result {
             .with_title("LYTBokkChoYx")
             .with_inner_size(Vec2::new(760.0, 520.0))
             .with_min_inner_size(Vec2::new(600.0, 420.0))
-            .with_resizable(true)
-            .with_transparent(true),
+            .with_resizable(true),
         ..Default::default()
     };
 
@@ -45,7 +46,9 @@ fn main() -> eframe::Result {
         Box::new(|cc| Ok(Box::new(PlayerApp::new(cc)))),
     );
 
-    // Force terminate all background processes and threads on exit
+    // eframe::run_native returns after the window is closed and on_exit has
+    // finished saving session state + history to disk. At this point it is safe
+    // to force-exit to terminate lingering background threads (IPC poller, etc.).
     std::process::exit(0);
 }
 
@@ -89,7 +92,11 @@ impl MpvController {
             return Err(format!("MPV was not found at {MPV_PATH}"));
         }
 
-        let ipc_path = format!(r"\\.\pipe\lytbokkchoyx-{}-{}", std::process::id(), unique_id());
+        let ipc_path = format!(
+            r"\\.\pipe\lytbokkchoyx-{}-{}",
+            std::process::id(),
+            unique_id()
+        );
         let ipc_arg = format!("--input-ipc-server={ipc_path}");
         let mut args = vec![
             "--no-video".to_owned(),
@@ -291,7 +298,7 @@ struct PlayerApp {
     chapters: Vec<Chapter>,
     show_debug: bool,
     debug_logs: VecDeque<String>,
-    debug_export_logs: Vec<String>,
+    debug_export_logs: VecDeque<String>,
     opacity: f32,
     load_tx: mpsc::Sender<LoadResult>,
     load_rx: Receiver<LoadResult>,
@@ -300,7 +307,9 @@ struct PlayerApp {
     history: Vec<HistoryItem>,
     active_tab: usize,
     last_history_save: Instant,
+    last_session_save: Instant,
     reconnect_attempts: usize,
+    api_rx: Receiver<String>,
 }
 
 impl PlayerApp {
@@ -308,6 +317,11 @@ impl PlayerApp {
         install_unicode_fonts(&cc.egui_ctx);
         apply_style(&cc.egui_ctx, 1.0);
         let (load_tx, load_rx) = mpsc::channel();
+        let (api_tx, api_rx) = mpsc::channel::<String>();
+
+        // Start lightweight HTTP API server for external queue management (n8n, LINE, etc.)
+        start_api_server(api_tx.clone());
+        start_remote_queue_poller(api_tx);
 
         let saved_state = load_session_state();
         let history = load_history();
@@ -329,8 +343,8 @@ impl PlayerApp {
             now_playing_title: String::new(),
             chapters: Vec::new(),
             show_debug: false,
-            debug_logs: VecDeque::with_capacity(120),
-            debug_export_logs: Vec::new(),
+            debug_logs: VecDeque::with_capacity(60),
+            debug_export_logs: VecDeque::with_capacity(500),
             opacity: 1.0,
             load_tx,
             load_rx,
@@ -339,7 +353,9 @@ impl PlayerApp {
             history,
             active_tab: 0,
             last_history_save: Instant::now(),
+            last_session_save: Instant::now(),
             reconnect_attempts: 0,
+            api_rx,
         };
 
         if let Some(state) = saved_state {
@@ -445,7 +461,8 @@ impl PlayerApp {
 
             let playback_uses_original_playlist = playback_url.is_none();
             let playback_target = playback_url.unwrap_or_else(|| original_input_url.clone());
-            let (cleaned_playback_target, extracted_play_time) = extract_time_from_url(&playback_target);
+            let (cleaned_playback_target, extracted_play_time) =
+                extract_time_from_url(&playback_target);
 
             let final_resume_position = resume_position.or(extracted_time).or(extracted_play_time);
 
@@ -492,11 +509,21 @@ impl PlayerApp {
             if self.time_pos > 0.0 {
                 if let Some(track_idx) = self.selected_track {
                     if let Some(item) = self.playlist.get(track_idx).cloned() {
-                        self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                        self.update_history_item(
+                            &item.url,
+                            &item.title,
+                            self.time_pos,
+                            Some(self.duration),
+                            true,
+                        );
                     }
                 }
             }
         }
+
+        // Save session state (URL + track + position) BEFORE resetting fields,
+        // so we can restore the exact resume point on next launch.
+        self.save_session_state();
 
         if let Some(mut mpv) = self.mpv.take() {
             mpv.stop();
@@ -602,20 +629,59 @@ impl PlayerApp {
         self.seek();
     }
 
+    fn poll_api_queue(&mut self) {
+        while let Ok(url) = self.api_rx.try_recv() {
+            let url = url.trim().to_owned();
+            if url.is_empty() {
+                continue;
+            }
+            self.push_debug(format!("API: Queuing URL: {url}"));
+            let (cleaned_url, _) = extract_time_from_url(&url);
+
+            if self.state == PlaybackState::Stopped && self.mpv.is_none() {
+                // Nothing playing → load and start immediately
+                self.url = cleaned_url.clone();
+                self.original_input_url = cleaned_url.clone();
+                let resume_pos = self.get_last_position(&cleaned_url);
+                self.start_load_job(cleaned_url, true, None, resume_pos, None, false);
+            } else {
+                // Already playing → append to queue
+                self.start_load_job(cleaned_url, true, None, None, None, true);
+            }
+        }
+    }
+
     fn poll_mpv(&mut self) {
         self.poll_load_jobs();
+        self.poll_api_queue();
 
         // Update history and remember last played position in memory
         if self.state == PlaybackState::Playing && self.time_pos > 0.0 {
             if let Some(track_idx) = self.selected_track {
                 if let Some(item) = self.playlist.get(track_idx).cloned() {
-                    let should_save_to_disk = self.last_history_save.elapsed() > Duration::from_secs(5);
-                    self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), should_save_to_disk);
+                    let should_save_to_disk =
+                        self.last_history_save.elapsed() > Duration::from_secs(5);
+                    self.update_history_item(
+                        &item.url,
+                        &item.title,
+                        self.time_pos,
+                        Some(self.duration),
+                        should_save_to_disk,
+                    );
                     if should_save_to_disk {
                         self.last_history_save = Instant::now();
                     }
                 }
             }
+        }
+
+        // Periodic session state save (every 30s) as crash-safety net
+        if (self.state == PlaybackState::Playing || self.state == PlaybackState::Paused)
+            && self.time_pos > 0.0
+            && self.last_session_save.elapsed() > Duration::from_secs(30)
+        {
+            self.save_session_state();
+            self.last_session_save = Instant::now();
         }
 
         if self.last_poll.elapsed() < Duration::from_millis(750) {
@@ -637,12 +703,18 @@ impl PlayerApp {
         match exit {
             Ok(Some(code)) => {
                 self.mpv = None;
-                
+
                 // Save current position before resetting
                 if self.time_pos > 0.0 {
                     if let Some(track_idx) = self.selected_track {
                         if let Some(item) = self.playlist.get(track_idx).cloned() {
-                            self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                            self.update_history_item(
+                                &item.url,
+                                &item.title,
+                                self.time_pos,
+                                Some(self.duration),
+                                true,
+                            );
                         }
                     }
                 }
@@ -672,7 +744,7 @@ impl PlayerApp {
                                         "Auto-reconnecting to {} at position {}s...",
                                         item.url, self.time_pos
                                     ));
-                                    
+
                                     let resume_pos = Some(self.time_pos);
                                     self.start_load_job(
                                         self.original_input_url.clone(),
@@ -686,7 +758,9 @@ impl PlayerApp {
                                 }
                             }
                         } else {
-                            self.fail("MPV exited unexpectedly. Maximum reconnection attempts reached.");
+                            self.fail(
+                                "MPV exited unexpectedly. Maximum reconnection attempts reached.",
+                            );
                             return;
                         }
                     }
@@ -716,14 +790,24 @@ impl PlayerApp {
                 if !result.playlist.is_empty() {
                     let old_len = self.playlist.len();
                     self.playlist.extend(result.playlist);
-                    self.status = format!("Added items to Play Queue. Total: {} items.", self.playlist.len());
+                    self.status = format!(
+                        "Added items to Play Queue. Total: {} items.",
+                        self.playlist.len()
+                    );
 
                     // Start playing if nothing is currently active
                     if self.state == PlaybackState::Stopped && self.mpv.is_none() {
                         self.selected_track = Some(old_len);
                         if let Some(item) = self.playlist.get(old_len) {
                             let resume_pos = self.get_last_position(&item.url);
-                            self.start_load_job(item.url.clone(), false, Some(old_len), resume_pos, None, false);
+                            self.start_load_job(
+                                item.url.clone(),
+                                false,
+                                Some(old_len),
+                                resume_pos,
+                                None,
+                                false,
+                            );
                         }
                     }
                 } else {
@@ -830,12 +914,18 @@ impl PlayerApp {
             MpvEvent::Log(line) => self.push_debug(line),
             MpvEvent::IpcError(err) => {
                 self.push_debug(format!("MPV IPC connection lost: {err}"));
-                
+
                 // Save current position immediately
                 if self.time_pos > 0.0 {
                     if let Some(track_idx) = self.selected_track {
                         if let Some(item) = self.playlist.get(track_idx).cloned() {
-                            self.update_history_item(&item.url, &item.title, self.time_pos, Some(self.duration), true);
+                            self.update_history_item(
+                                &item.url,
+                                &item.title,
+                                self.time_pos,
+                                Some(self.duration),
+                                true,
+                            );
                         }
                     }
                 }
@@ -853,7 +943,7 @@ impl PlayerApp {
                                     "Auto-reconnecting to {} at position {}s...",
                                     item.url, self.time_pos
                                 ));
-                                
+
                                 let resume_pos = Some(self.time_pos);
                                 self.start_load_job(
                                     self.original_input_url.clone(),
@@ -870,7 +960,7 @@ impl PlayerApp {
                         self.fail("MPV connection lost. Maximum reconnection attempts reached.");
                     }
                 }
-                
+
                 // If not playing/paused or no reconnect was triggered, stop MPV controller cleanly
                 self.stop();
             }
@@ -904,11 +994,14 @@ impl PlayerApp {
 
     fn push_debug(&mut self, line: impl Into<String>) {
         let line = line.into();
-        if self.debug_logs.len() >= 120 {
+        if self.debug_logs.len() >= 60 {
             self.debug_logs.pop_front();
         }
+        if self.debug_export_logs.len() >= 500 {
+            self.debug_export_logs.pop_front();
+        }
         self.debug_logs.push_back(line.clone());
-        self.debug_export_logs.push(line);
+        self.debug_export_logs.push_back(line);
     }
 
     fn export_debug_logs(&mut self) {
@@ -916,7 +1009,8 @@ impl PlayerApp {
         let contents = if self.debug_export_logs.is_empty() {
             "No debug logs captured.\n".to_owned()
         } else {
-            format!("{}\n", self.debug_export_logs.join("\n"))
+            let lines: Vec<&str> = self.debug_export_logs.iter().map(|s| s.as_str()).collect();
+            format!("{}\n", lines.join("\n"))
         };
 
         match fs::write(path, contents) {
@@ -949,15 +1043,23 @@ impl PlayerApp {
 }
 
 impl eframe::App for PlayerApp {
-        fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-            let _ = save_history(&self.history);
-            self.save_session_state();
-            self.stop(); // Stop MPV and terminate sub-processes cleanly
-        }
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // IMPORTANT: Save session state BEFORE stop(), because stop() resets
+        // time_pos and seek_position to 0.0, which would lose the resume position.
+        let _ = save_history(&self.history);
+        self.save_session_state();
+        self.stop(); // Stop MPV and terminate sub-processes cleanly
+    }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_mpv();
-        ctx.request_repaint_after(Duration::from_millis(250));
+        // Use faster repaint only when actively playing; otherwise save CPU/RAM
+        let repaint_interval = if self.state == PlaybackState::Playing || self.loading {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(750)
+        };
+        ctx.request_repaint_after(repaint_interval);
         apply_style(ctx, self.opacity);
 
         TopBottomPanel::top("display").show(ctx, |ui| {
@@ -1020,12 +1122,9 @@ impl eframe::App for PlayerApp {
                         {
                             self.load();
                         }
-                        
+
                         if ui
-                            .add_enabled(
-                                !self.loading,
-                                Button::new("+ Queue"),
-                            )
+                            .add_enabled(!self.loading, Button::new("+ Queue"))
                             .clicked()
                         {
                             let url = self.url.trim().to_owned();
@@ -1138,32 +1237,41 @@ impl eframe::App for PlayerApp {
 
                     ui.add_space(8.0);
                     ui.label(RichText::new("Chapters").strong());
-                    ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                        if self.chapters.is_empty() {
-                            ui.label(RichText::new("No chapter markers found.").small());
-                        }
-
-                        for index in 0..self.chapters.len() {
-                            let chapter = &self.chapters[index];
-                            let label = format!(
-                                "{}  {}",
-                                format_duration(chapter.start_time),
-                                chapter.title
-                            );
-                            if ui.selectable_label(false, label).clicked() {
-                                self.seek_chapter(chapter.start_time);
+                    ScrollArea::vertical()
+                        .id_salt("chapters_scroll")
+                        .max_height(150.0)
+                        .show(ui, |ui| {
+                            if self.chapters.is_empty() {
+                                ui.label(RichText::new("No chapter markers found.").small());
                             }
-                        }
-                    });
+
+                            for index in 0..self.chapters.len() {
+                                let chapter = &self.chapters[index];
+                                let label = format!(
+                                    "{}  {}",
+                                    format_duration(chapter.start_time),
+                                    chapter.title
+                                );
+                                if ui.selectable_label(false, label).clicked() {
+                                    self.seek_chapter(chapter.start_time);
+                                }
+                            }
+                        });
                 });
 
                 columns[1].vertical(|ui| {
                     ui.horizontal(|ui| {
-                        if ui.selectable_label(self.active_tab == 0, "Play Queue").clicked() {
+                        if ui
+                            .selectable_label(self.active_tab == 0, "Play Queue")
+                            .clicked()
+                        {
                             self.active_tab = 0;
                         }
                         ui.label("|");
-                        if ui.selectable_label(self.active_tab == 1, "History").clicked() {
+                        if ui
+                            .selectable_label(self.active_tab == 1, "History")
+                            .clicked()
+                        {
                             self.active_tab = 1;
                         }
                     });
@@ -1172,156 +1280,194 @@ impl eframe::App for PlayerApp {
                     if self.active_tab == 0 {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Queue").strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Clear").clicked() {
-                                    self.stop();
-                                    self.playlist.clear();
-                                    self.selected_track = None;
-                                    self.chapters.clear();
-                                }
-                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Clear").clicked() {
+                                        self.stop();
+                                        self.playlist.clear();
+                                        self.selected_track = None;
+                                        self.chapters.clear();
+                                    }
+                                },
+                            );
                         });
                         ui.add_space(4.0);
 
-                        ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                            if self.playlist.is_empty() {
-                                ui.label(RichText::new("Queue is empty. Enter URL to Add/Load.").small());
-                            }
-
-                            let mut to_remove = None;
-                            let mut to_move_up = None;
-                            let mut to_move_down = None;
-
-                            for index in 0..self.playlist.len() {
-                                let item = self.playlist[index].clone();
-                                let selected = self.selected_track == Some(index);
-                                let duration = item
-                                    .duration
-                                    .map(format_duration)
-                                    .unwrap_or_else(|| "--:--".to_owned());
-                                
-                                ui.horizontal(|ui| {
-                                    let title_text = format!("{:02}. {}", index + 1, item.title);
-                                    let resp = ui.selectable_label(
-                                        selected,
-                                        RichText::new(title_text).color(if selected {
-                                            Color32::from_rgb(245, 190, 68)
-                                        } else {
-                                            Color32::from_rgb(200, 205, 215)
-                                        })
+                        ScrollArea::vertical()
+                            .id_salt("play_queue_scroll")
+                            .max_height(250.0)
+                            .show(ui, |ui| {
+                                if self.playlist.is_empty() {
+                                    ui.label(
+                                        RichText::new("Queue is empty. Enter URL to Add/Load.")
+                                            .small(),
                                     );
-                                    
-                                    if resp.clicked() {
-                                        self.play_track(index);
-                                    }
+                                }
 
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(RichText::new(duration).small().color(Color32::from_rgb(120, 122, 130)));
-                                        
-                                        if ui.small_button("❌").clicked() {
-                                            to_remove = Some(index);
+                                let mut to_remove = None;
+                                let mut to_move_up = None;
+                                let mut to_move_down = None;
+
+                                for index in 0..self.playlist.len() {
+                                    let item = self.playlist[index].clone();
+                                    let selected = self.selected_track == Some(index);
+                                    let duration = item
+                                        .duration
+                                        .map(format_duration)
+                                        .unwrap_or_else(|| "--:--".to_owned());
+
+                                    ui.horizontal(|ui| {
+                                        let title_text =
+                                            format!("{:02}. {}", index + 1, item.title);
+                                        let resp = ui.selectable_label(
+                                            selected,
+                                            RichText::new(title_text).color(if selected {
+                                                Color32::from_rgb(245, 190, 68)
+                                            } else {
+                                                Color32::from_rgb(200, 205, 215)
+                                            }),
+                                        );
+
+                                        if resp.clicked() {
+                                            self.play_track(index);
                                         }
-                                        if index > 0 && ui.small_button("🔼").clicked() {
-                                            to_move_up = Some(index);
-                                        }
-                                        if index < self.playlist.len() - 1 && ui.small_button("🔽").clicked() {
-                                            to_move_down = Some(index);
-                                        }
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(duration)
+                                                        .small()
+                                                        .color(Color32::from_rgb(120, 122, 130)),
+                                                );
+
+                                                if ui.small_button("❌").clicked() {
+                                                    to_remove = Some(index);
+                                                }
+                                                if index > 0 && ui.small_button("🔼").clicked() {
+                                                    to_move_up = Some(index);
+                                                }
+                                                if index < self.playlist.len() - 1
+                                                    && ui.small_button("🔽").clicked()
+                                                {
+                                                    to_move_down = Some(index);
+                                                }
+                                            },
+                                        );
                                     });
-                                });
-                            }
+                                }
 
-                            if let Some(idx) = to_remove {
-                                self.playlist.remove(idx);
-                                if self.selected_track == Some(idx) {
-                                    self.stop();
-                                    self.selected_track = if self.playlist.is_empty() { None } else { Some(0) };
-                                } else if let Some(sel) = self.selected_track {
-                                    if sel > idx {
-                                        self.selected_track = Some(sel - 1);
+                                if let Some(idx) = to_remove {
+                                    self.playlist.remove(idx);
+                                    if self.selected_track == Some(idx) {
+                                        self.stop();
+                                        self.selected_track = if self.playlist.is_empty() {
+                                            None
+                                        } else {
+                                            Some(0)
+                                        };
+                                    } else if let Some(sel) = self.selected_track {
+                                        if sel > idx {
+                                            self.selected_track = Some(sel - 1);
+                                        }
                                     }
                                 }
-                            }
-                            if let Some(idx) = to_move_up {
-                                self.playlist.swap(idx, idx - 1);
-                                if self.selected_track == Some(idx) {
-                                    self.selected_track = Some(idx - 1);
-                                } else if self.selected_track == Some(idx - 1) {
-                                    self.selected_track = Some(idx);
+                                if let Some(idx) = to_move_up {
+                                    self.playlist.swap(idx, idx - 1);
+                                    if self.selected_track == Some(idx) {
+                                        self.selected_track = Some(idx - 1);
+                                    } else if self.selected_track == Some(idx - 1) {
+                                        self.selected_track = Some(idx);
+                                    }
                                 }
-                            }
-                            if let Some(idx) = to_move_down {
-                                self.playlist.swap(idx, idx + 1);
-                                if self.selected_track == Some(idx) {
-                                    self.selected_track = Some(idx + 1);
-                                } else if self.selected_track == Some(idx + 1) {
-                                    self.selected_track = Some(idx);
+                                if let Some(idx) = to_move_down {
+                                    self.playlist.swap(idx, idx + 1);
+                                    if self.selected_track == Some(idx) {
+                                        self.selected_track = Some(idx + 1);
+                                    } else if self.selected_track == Some(idx + 1) {
+                                        self.selected_track = Some(idx);
+                                    }
                                 }
-                            }
-                        });
+                            });
                     } else {
                         ui.horizontal(|ui| {
                             ui.label(RichText::new("Listening History").strong());
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.button("Clear").clicked() {
-                                    self.history.clear();
-                                    let _ = save_history(&self.history);
-                                }
-                            });
-                        });
-                        ScrollArea::vertical().max_height(250.0).show(ui, |ui| {
-                            if self.history.is_empty() {
-                                ui.label(RichText::new("No history items recorded.").small());
-                            }
-
-                            for index in 0..self.history.len() {
-                                let item = self.history[index].clone();
-                                let duration = item
-                                    .duration
-                                    .map(format_duration)
-                                    .unwrap_or_else(|| "--:--".to_owned());
-                                let saved_at = format_duration(item.last_position);
-                                
-                                ui.horizontal(|ui| {
-                                    let label = format!("{:02}. {}", index + 1, item.title);
-                                    let resp = ui.selectable_label(
-                                        false,
-                                        RichText::new(label).color(Color32::from_rgb(200, 205, 215))
-                                    );
-                                    
-                                    if resp.clicked() {
-                                        let url = item.url.clone();
-                                        self.url = url.clone();
-                                        self.original_input_url = url.clone();
-                                        
-                                        self.seek_position = item.last_position;
-                                        self.seek_input_buffer = format_duration(item.last_position);
-                                        self.time_pos = item.last_position;
-                                        
-                                        let queue_idx = self.playlist.iter().position(|q| q.url == url);
-                                        if let Some(q_idx) = queue_idx {
-                                            self.play_track(q_idx);
-                                        } else {
-                                            let new_idx = self.playlist.len();
-                                            self.playlist.push(PlaylistItem {
-                                                title: item.title.clone(),
-                                                url: url.clone(),
-                                                duration: item.duration,
-                                            });
-                                            self.play_track(new_idx);
-                                        }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.button("Clear").clicked() {
+                                        self.history.clear();
+                                        let _ = save_history(&self.history);
                                     }
-                                    
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        ui.label(
-                                            RichText::new(format!("{}/{}", saved_at, duration))
-                                                .small()
-                                                .color(Color32::from_rgb(120, 122, 130))
+                                },
+                            );
+                        });
+                        ScrollArea::vertical()
+                            .id_salt("history_scroll")
+                            .max_height(250.0)
+                            .show(ui, |ui| {
+                                if self.history.is_empty() {
+                                    ui.label(RichText::new("No history items recorded.").small());
+                                }
+
+                                for index in 0..self.history.len() {
+                                    let item = self.history[index].clone();
+                                    let duration = item
+                                        .duration
+                                        .map(format_duration)
+                                        .unwrap_or_else(|| "--:--".to_owned());
+                                    let saved_at = format_duration(item.last_position);
+
+                                    ui.horizontal(|ui| {
+                                        let label = format!("{:02}. {}", index + 1, item.title);
+                                        let resp = ui.selectable_label(
+                                            false,
+                                            RichText::new(label)
+                                                .color(Color32::from_rgb(200, 205, 215)),
+                                        );
+
+                                        if resp.clicked() {
+                                            let url = item.url.clone();
+                                            self.url = url.clone();
+                                            self.original_input_url = url.clone();
+
+                                            self.seek_position = item.last_position;
+                                            self.seek_input_buffer =
+                                                format_duration(item.last_position);
+                                            self.time_pos = item.last_position;
+
+                                            let queue_idx =
+                                                self.playlist.iter().position(|q| q.url == url);
+                                            if let Some(q_idx) = queue_idx {
+                                                self.play_track(q_idx);
+                                            } else {
+                                                let new_idx = self.playlist.len();
+                                                self.playlist.push(PlaylistItem {
+                                                    title: item.title.clone(),
+                                                    url: url.clone(),
+                                                    duration: item.duration,
+                                                });
+                                                self.play_track(new_idx);
+                                            }
+                                        }
+
+                                        ui.with_layout(
+                                            egui::Layout::right_to_left(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{}/{}",
+                                                        saved_at, duration
+                                                    ))
+                                                    .small()
+                                                    .color(Color32::from_rgb(120, 122, 130)),
+                                                );
+                                            },
                                         );
                                     });
-                                });
-                            }
-                        });
+                                }
+                            });
                     }
                 });
             });
@@ -1334,11 +1480,14 @@ impl eframe::App for PlayerApp {
                         self.export_debug_logs();
                     }
                 });
-                ScrollArea::vertical().max_height(110.0).show(ui, |ui| {
-                    for line in &self.debug_logs {
-                        ui.label(RichText::new(line).small().monospace());
-                    }
-                });
+                ScrollArea::vertical()
+                    .id_salt("debug_scroll")
+                    .max_height(110.0)
+                    .show(ui, |ui| {
+                        for line in &self.debug_logs {
+                            ui.label(RichText::new(line).small().monospace());
+                        }
+                    });
             }
 
             ui.add_space(10.0);
@@ -1675,21 +1824,27 @@ fn parse_timestamp(text: &str) -> Option<f64> {
 
 fn install_unicode_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
-    fonts.font_data.insert(
-        "leelawadee_ui_thai".to_owned(),
-        FontData::from_static(include_bytes!(r"C:\Windows\Fonts\LeelawUI.ttf")).into(),
-    );
 
-    fonts
-        .families
-        .entry(FontFamily::Proportional)
-        .or_default()
-        .insert(0, "leelawadee_ui_thai".to_owned());
-    fonts
-        .families
-        .entry(FontFamily::Monospace)
-        .or_default()
-        .push("leelawadee_ui_thai".to_owned());
+    // Load font from file at runtime instead of include_bytes! to avoid
+    // embedding ~15 MB into the binary (which stays in RAM permanently).
+    let font_path = Path::new(r"C:\Windows\Fonts\LeelawUI.ttf");
+    if let Ok(font_bytes) = fs::read(font_path) {
+        fonts.font_data.insert(
+            "leelawadee_ui_thai".to_owned(),
+            FontData::from_owned(font_bytes).into(),
+        );
+
+        fonts
+            .families
+            .entry(FontFamily::Proportional)
+            .or_default()
+            .insert(0, "leelawadee_ui_thai".to_owned());
+        fonts
+            .families
+            .entry(FontFamily::Monospace)
+            .or_default()
+            .push("leelawadee_ui_thai".to_owned());
+    }
 
     ctx.set_fonts(fonts);
 }
@@ -1745,7 +1900,14 @@ fn save_history(history: &[HistoryItem]) -> Result<(), String> {
 }
 
 impl PlayerApp {
-    fn update_history_item(&mut self, url: &str, title: &str, position: f64, duration: Option<f64>, save_to_disk: bool) {
+    fn update_history_item(
+        &mut self,
+        url: &str,
+        title: &str,
+        position: f64,
+        duration: Option<f64>,
+        save_to_disk: bool,
+    ) {
         if url.trim().is_empty() {
             return;
         }
@@ -1770,7 +1932,11 @@ impl PlayerApp {
         } else {
             let item = HistoryItem {
                 url: url.to_owned(),
-                title: if clean_title.is_empty() { url.to_owned() } else { clean_title.to_owned() },
+                title: if clean_title.is_empty() {
+                    url.to_owned()
+                } else {
+                    clean_title.to_owned()
+                },
                 last_position: position,
                 duration,
                 last_played: now,
@@ -1784,7 +1950,8 @@ impl PlayerApp {
     }
 
     fn get_last_position(&self, url: &str) -> Option<f64> {
-        self.history.iter()
+        self.history
+            .iter()
             .find(|item| item.url == url)
             .map(|item| item.last_position)
     }
@@ -1801,12 +1968,12 @@ fn extract_time_from_url(url: &str) -> (String, Option<f64>) {
                 .find('&')
                 .map(|idx| start_val + idx)
                 .unwrap_or(cleaned_url.len());
-            
+
             let val_str = &cleaned_url[start_val..end_val];
             if let Some(secs) = parse_url_time_string(val_str) {
                 extracted_seconds = Some(secs);
             }
-            
+
             let start_remove = if pos > 0 && cleaned_url.as_bytes()[pos - 1] == b'&' {
                 pos - 1
             } else if pos > 0 && cleaned_url.as_bytes()[pos - 1] == b'?' {
@@ -1818,21 +1985,24 @@ fn extract_time_from_url(url: &str) -> (String, Option<f64>) {
             } else {
                 pos
             };
-            
+
             let mut end_remove = end_val;
-            if start_remove == pos && end_val < cleaned_url.len() && cleaned_url.as_bytes()[end_val] == b'&' {
+            if start_remove == pos
+                && end_val < cleaned_url.len()
+                && cleaned_url.as_bytes()[end_val] == b'&'
+            {
                 end_remove = end_val + 1;
             }
-            
+
             cleaned_url.replace_range(start_remove..end_remove, "");
-            
+
             if cleaned_url.contains("?&") {
                 cleaned_url = cleaned_url.replace("?&", "?");
             }
             if cleaned_url.ends_with('?') || cleaned_url.ends_with('&') {
                 cleaned_url.pop();
             }
-            
+
             break;
         }
     }
@@ -1846,7 +2016,7 @@ fn parse_url_time_string(s: &str) -> Option<f64> {
     if let Ok(secs) = clean_s.parse::<f64>() {
         return Some(secs);
     }
-    
+
     let mut total_secs = 0.0;
     let mut current_num = String::new();
     for c in s.chars() {
@@ -1869,4 +2039,312 @@ fn parse_url_time_string(s: &str) -> Option<f64> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight HTTP API Server (zero external dependencies)
+// ---------------------------------------------------------------------------
+
+fn start_api_server(tx: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        let addr = format!("0.0.0.0:{API_PORT}");
+        let listener = match TcpListener::bind(&addr) {
+            Ok(l) => {
+                eprintln!("[API] Listening on http://{addr}");
+                l
+            }
+            Err(err) => {
+                eprintln!("[API] Failed to bind {addr}: {err}");
+                return;
+            }
+        };
+
+        for stream in listener.incoming().flatten() {
+            let tx = tx.clone();
+            let peer_addr = stream.peer_addr().ok();
+            // Handle each connection in a short-lived thread to avoid blocking
+            thread::spawn(move || handle_api_request(stream, peer_addr, &tx));
+        }
+    });
+}
+
+fn start_remote_queue_poller(tx: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        loop {
+            let Some(token) = load_queue_api_token() else {
+                thread::sleep(Duration::from_secs(10));
+                continue;
+            };
+            let base_url = std::env::var("LYTB_QUEUE_SERVER_URL")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| fs::read_to_string("server-url.txt").ok())
+                .map(|value| value.trim().trim_end_matches('/').to_owned())
+                .unwrap_or_else(|| "https://player-api.kankrittapon.online".to_owned());
+            let device_id = std::env::var("LYTB_DEVICE_ID")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "primary".to_owned());
+
+            let mut command = Command::new("curl.exe");
+            command.args([
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--max-time",
+                "10",
+                "-H",
+                &format!("Authorization: Bearer {token}"),
+                &format!("{base_url}/v1/jobs/next?deviceId={device_id}"),
+            ]);
+            #[cfg(windows)]
+            command.creation_flags(CREATE_NO_WINDOW);
+
+            if let Ok(output) = command.output() {
+                if output.status.success() && !output.stdout.is_empty() {
+                    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&output.stdout) {
+                        let job = value.get("job");
+                        let id = job
+                            .and_then(|item| item.get("id"))
+                            .and_then(|item| item.as_str());
+                        let url = job
+                            .and_then(|item| item.get("url"))
+                            .and_then(|item| item.as_str());
+                        if let (Some(id), Some(url)) = (id, url) {
+                            if tx.send(url.to_owned()).is_err() {
+                                break;
+                            }
+                            acknowledge_remote_job(&base_url, &token, &device_id, id);
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_secs(3));
+        }
+    });
+}
+
+fn acknowledge_remote_job(base_url: &str, token: &str, device_id: &str, job_id: &str) {
+    let body = json!({ "deviceId": device_id }).to_string();
+    let mut command = Command::new("curl.exe");
+    command.args([
+        "--silent",
+        "--show-error",
+        "--fail",
+        "--max-time",
+        "10",
+        "-X",
+        "POST",
+        "-H",
+        &format!("Authorization: Bearer {token}"),
+        "-H",
+        "Content-Type: application/json",
+        "--data",
+        &body,
+        &format!("{base_url}/v1/jobs/{job_id}/complete"),
+    ]);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW);
+    let _ = command.output();
+}
+
+fn handle_api_request(
+    mut stream: TcpStream,
+    peer_addr: Option<SocketAddr>,
+    tx: &mpsc::Sender<String>,
+) {
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
+
+    let mut buf = [0u8; 8192];
+    let n = match stream.read(&mut buf) {
+        Ok(n) if n > 0 => n,
+        _ => {
+            send_http_response(&mut stream, 400, r#"{"error":"empty request"}"#);
+            return;
+        }
+    };
+
+    let request = String::from_utf8_lossy(&buf[..n]);
+    let first_line = request.lines().next().unwrap_or("");
+
+    // CORS preflight
+    if first_line.starts_with("OPTIONS ") {
+        send_http_cors_preflight(&mut stream);
+        return;
+    }
+
+    if first_line.starts_with("POST /queue") {
+        if !authorize_queue_request(&request, peer_addr) {
+            let token_configured = load_queue_api_token().is_some();
+            let (status, body) = if token_configured {
+                (401, r#"{"error":"unauthorized"}"#)
+            } else {
+                (
+                    503,
+                    r#"{"error":"remote queue API is disabled until api-token.txt is configured"}"#,
+                )
+            };
+            send_http_response(&mut stream, status, body);
+            return;
+        }
+
+        // Extract JSON body after the \r\n\r\n separator
+        let body = request
+            .find("\r\n\r\n")
+            .map(|pos| &request[pos + 4..])
+            .unwrap_or("");
+
+        if body.is_empty() {
+            send_http_response(
+                &mut stream,
+                400,
+                r#"{"error":"empty body, expected {\"url\":\"...\"}}"#,
+            );
+            return;
+        }
+
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(parsed) => {
+                if let Some(url) = parsed.get("url").and_then(|v| v.as_str()) {
+                    let url = url.trim();
+                    if url.is_empty() {
+                        send_http_response(&mut stream, 400, r#"{"error":"url field is empty"}"#);
+                        return;
+                    }
+                    if url.len() > 4096
+                        || !(url.starts_with("https://") || url.starts_with("http://"))
+                    {
+                        send_http_response(
+                            &mut stream,
+                            400,
+                            r#"{"error":"url must use http or https and be at most 4096 characters"}"#,
+                        );
+                        return;
+                    }
+                    let _ = tx.send(url.to_owned());
+                    let resp = json!({"status": "queued", "url": url});
+                    send_http_response(&mut stream, 200, &resp.to_string());
+                } else {
+                    send_http_response(
+                        &mut stream,
+                        400,
+                        r#"{"error":"missing 'url' field in JSON body"}"#,
+                    );
+                }
+            }
+            Err(err) => {
+                let resp = json!({"error": format!("invalid JSON: {err}")});
+                send_http_response(&mut stream, 400, &resp.to_string());
+            }
+        }
+    } else if first_line.starts_with("GET /health") {
+        send_http_response(&mut stream, 200, r#"{"status":"ok","app":"LYTBokkChoYx"}"#);
+    } else if first_line.starts_with("GET /queue-help") {
+        let help = json!({
+            "endpoints": {
+                "POST /queue": {
+                    "description": "Add a URL to the play queue",
+                    "body": {"url": "https://youtube.com/watch?v=..."},
+                    "remote_auth": "Authorization: Bearer <token from api-token.txt>",
+                    "example_curl": format!("curl -X POST http://localhost:{API_PORT}/queue -H \"Content-Type: application/json\" -d '{{\"url\":\"https://youtube.com/watch?v=dQw4w9WgXcQ\"}}'")
+                },
+                "GET /health": {
+                    "description": "Check if the player is running"
+                },
+                "GET /queue-help": {
+                    "description": "Show this help message"
+                }
+            }
+        });
+        send_http_response(
+            &mut stream,
+            200,
+            &serde_json::to_string_pretty(&help).unwrap_or_default(),
+        );
+    } else {
+        send_http_response(
+            &mut stream,
+            404,
+            r#"{"error":"not found","hint":"try GET /queue-help"}"#,
+        );
+    }
+}
+
+fn load_queue_api_token() -> Option<String> {
+    if let Ok(value) = std::env::var("LYTB_QUEUE_API_TOKEN") {
+        let value = value.trim().to_owned();
+        if !value.is_empty() {
+            return Some(value);
+        }
+    }
+    fs::read_to_string("api-token.txt")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn authorize_queue_request(request: &str, peer_addr: Option<SocketAddr>) -> bool {
+    if peer_addr.is_some_and(|addr| addr.ip().is_loopback()) {
+        return true;
+    }
+    let Some(expected) = load_queue_api_token() else {
+        return false;
+    };
+    let supplied = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("authorization").then(|| {
+            value
+                .trim()
+                .strip_prefix("Bearer ")
+                .unwrap_or("")
+                .to_owned()
+        })
+    });
+    supplied.is_some_and(|value| constant_time_equal(value.as_bytes(), expected.as_bytes()))
+}
+
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+fn send_http_response(stream: &mut TcpStream, status_code: u16, body: &str) {
+    let status_text = match status_code {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let response = format!(
+        "HTTP/1.1 {status_code} {status_text}\r\n\
+         Content-Type: application/json; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+fn send_http_cors_preflight(stream: &mut TcpStream) {
+    let response = "HTTP/1.1 204 No Content\r\n\
+        Access-Control-Allow-Origin: *\r\n\
+        Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+        Access-Control-Allow-Headers: Content-Type\r\n\
+        Access-Control-Max-Age: 86400\r\n\
+        Connection: close\r\n\
+        \r\n";
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
 }

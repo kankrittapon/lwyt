@@ -6,6 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
 
@@ -20,6 +24,8 @@ jobs:
 
       - name: Install Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
 
       - name: Cache Cargo Dependencies
         uses: actions/cache@v4
@@ -35,22 +41,42 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Install WiX Toolset
+        shell: pwsh
+        run: dotnet tool install --global wix
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Verify Source
+        shell: pwsh
         run: |
-          dotnet tool install --global wix
-          wix eula accept wix7
+          cargo fmt --all -- --check
+          cargo test --locked
 
       - name: Run Build and Packaging Script
-        run: powershell -ExecutionPolicy Bypass -File ./build.ps1
+        shell: pwsh
+        run: ./build.ps1 -RequireInstallers
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LYTBokkChoYx-${{ github.ref_name }}-windows-x64
+          path: |
+            target/release/LYTBokkChoYx.msi
+            target/release/LYTBokkChoYx_Setup.exe
+            target/release/lytbokkchoyx.exe
+          if-no-files-found: error
 
       - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: "Release ${{ github.ref_name }}"
+          generate_release_notes: true
           files: |
             target/release/LYTBokkChoYx.msi
             target/release/LYTBokkChoYx_Setup.exe
             target/release/lytbokkchoyx.exe
           draft: false
           prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,2 +1,6 @@
 /target
 config.json
+api-token.txt
+history.json
+server-url.txt
+*.before-*
